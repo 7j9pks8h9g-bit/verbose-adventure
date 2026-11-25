@@ -35,6 +35,14 @@ MIN_LEAD_BPS = 10.0        # stronger lead filter (was 8)
 MIN_MOM_SHORT = 4.0        # short momentum confirmation
 MIN_MOM_MED = 2.5          # medium momentum confirmation
 
+# --- High-prob fade (when market is 96%+ and often reverses) ---
+FADE_ENABLED = os.getenv("FADE_ENABLED", "1").strip() not in ("0", "false", "False", "no")
+FADE_MIN_PROB = float(os.getenv("FADE_MIN_PROB", "0.96"))       # start watching from this market price
+FADE_MIN_TIME_LEFT = int(os.getenv("FADE_MIN_TIME_LEFT", "40"))  # don't fade in last N seconds
+FADE_MAX_TIME_LEFT = int(os.getenv("FADE_MAX_TIME_LEFT", "150")) # ignore too-early spikes
+FADE_MIN_CONFIDENCE = float(os.getenv("FADE_MIN_CONFIDENCE", "0.70"))
+FADE_MOM_WEAK = float(os.getenv("FADE_MOM_WEAK", "2.5"))         # |mom_short| below this = weak confirmation
+
 # Chainlink symbol map for RTDS
 CHAINLINK_SYM = {
     "BTCUSDT": "btc/usd",
@@ -64,6 +72,11 @@ class WindowState:
         self.series: deque = deque(maxlen=400)  # (seconds_in_window, price) for chart
         self.early: Optional[dict] = None       # early (low-confidence) forecast made right at window start
         self.prev_tail: list = []                # last prices of the previous window (trend before the start)
+        # High-prob fade state
+        self.fade_sent: bool = False
+        self.last_fade: Optional[dict] = None
+        self.market_p: Optional[dict] = None    # {"UP": float, "DOWN": float, "ts": int}
+        self._mkt_fetch_ts: float = 0.0
 
     def reset(self, price: float, start: datetime, source: str = ""):
         self.price_to_beat = price
@@ -81,6 +94,10 @@ class WindowState:
         self.last_error = None
         self.source = source
         self.open_confirmed = False
+        self.fade_sent = False
+        self.last_fade = None
+        self.market_p = None
+        self._mkt_fetch_ts = 0.0
 
 
 state: Dict[str, WindowState] = {s: WindowState(s) for s in SYMBOLS}
@@ -216,6 +233,124 @@ def is_strong_signal(signal: dict) -> bool:
     if signal.get("side") is None:
         return False
     return signal.get("confidence", 0) >= MIN_CONFIDENCE and signal.get("score", 0) >= 2
+
+
+async def fetch_market_probs(client: httpx.AsyncClient, coin: str, start_unix: int) -> Optional[dict]:
+    """Best ask for UP and DOWN tokens on the current 5m market. Returns {"UP": p, "DOWN": p} or None."""
+    slug = f"{coin.lower()}-updown-5m-{start_unix}"
+    try:
+        meta = await paper_market_meta(client, slug)
+        if not meta or not meta[0]:
+            return None
+        out: Dict[str, float] = {}
+        for side_name, want in (("UP", "up"), ("DOWN", "down")):
+            token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
+            if not token:
+                continue
+            r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=4.0)
+            book = r.json()
+            best = None
+            for x in (book.get("asks") or []):
+                try:
+                    p = float(x["price"])
+                    sz = float(x["size"])
+                except Exception:
+                    continue
+                if 0 < p <= 0.99 and sz > 0:
+                    if best is None or p < best:
+                        best = p
+            if best is not None:
+                out[side_name] = best
+        if "UP" in out or "DOWN" in out:
+            # fill missing side as complement when possible
+            if "UP" in out and "DOWN" not in out:
+                out["DOWN"] = round(1.0 - out["UP"], 4)
+            elif "DOWN" in out and "UP" not in out:
+                out["UP"] = round(1.0 - out["DOWN"], 4)
+            return out
+    except Exception as e:
+        logger.debug(f"fetch_market_probs {coin}: {e}")
+    return None
+
+
+def generate_fade_signal(
+    market_p: dict,
+    price_to_beat: float,
+    current_price: float,
+    seconds_passed: int,
+    prices: deque,
+) -> Optional[dict]:
+    """
+    Fade a side that the market prices at >= FADE_MIN_PROB when:
+    - time left is still meaningful (not last seconds, not too early)
+    - BTC momentum does NOT strongly confirm that high-prob side
+    Returns a signal dict with type=FADE_HIGH or None.
+    """
+    if not FADE_ENABLED or not market_p:
+        return None
+    time_left = WINDOW_SECONDS - seconds_passed
+    if time_left < FADE_MIN_TIME_LEFT or time_left > FADE_MAX_TIME_LEFT:
+        return None
+
+    p_up = market_p.get("UP")
+    p_down = market_p.get("DOWN")
+    high_side = None
+    high_p = 0.0
+    if p_up is not None and p_up >= FADE_MIN_PROB:
+        high_side, high_p = "UP", p_up
+    if p_down is not None and p_down >= FADE_MIN_PROB and p_down > high_p:
+        high_side, high_p = "DOWN", p_down
+    if high_side is None:
+        return None
+
+    fade_side = "DOWN" if high_side == "UP" else "UP"
+    lead_bps = ((current_price - price_to_beat) / price_to_beat) * 10000 if price_to_beat else 0.0
+    mom_short = momentum_bps(prices, lookback=12)
+    mom_med = momentum_bps(prices, lookback=25)
+
+    # Does real BTC momentum still strongly support the high-prob side?
+    if high_side == "UP":
+        strong_confirm = (lead_bps >= MIN_LEAD_BPS and mom_short >= MIN_MOM_SHORT) or mom_short >= (MIN_MOM_SHORT + 2)
+    else:
+        strong_confirm = (lead_bps <= -MIN_LEAD_BPS and mom_short <= -MIN_MOM_SHORT) or mom_short <= -(MIN_MOM_SHORT + 2)
+
+    if strong_confirm:
+        # Trend still supports the favourite — do not fade
+        return None
+
+    # Weak or opposing momentum → fade is more attractive
+    opposing = (high_side == "UP" and mom_short < -FADE_MOM_WEAK) or (high_side == "DOWN" and mom_short > FADE_MOM_WEAK)
+    weak = abs(mom_short) < FADE_MOM_WEAK
+
+    base = 0.70
+    if opposing:
+        base = 0.82
+    elif weak:
+        base = 0.74
+    # Higher market price → slightly higher fade confidence (more "overcooked")
+    overcook = min(max(high_p - FADE_MIN_PROB, 0) * 2.0, 0.08)
+    # More time left → a bit more room for reversal
+    time_boost = 0.04 if time_left >= 70 else (0.02 if time_left >= 50 else 0.0)
+    confidence = min(base + overcook + time_boost, 0.90)
+
+    if confidence < FADE_MIN_CONFIDENCE:
+        return None
+
+    return {
+        "side": fade_side,
+        "confidence": round(confidence, 3),
+        "type": "FADE_HIGH",
+        "high_side": high_side,
+        "high_p": round(high_p, 4),
+        "market_p_up": round(p_up, 4) if p_up is not None else None,
+        "market_p_down": round(p_down, 4) if p_down is not None else None,
+        "lead_bps": round(lead_bps, 2),
+        "mom_short": round(mom_short, 2),
+        "mom_med": round(mom_med, 2),
+        "time_left": time_left,
+        "reason": f"fade_{high_side}@{high_p:.2f}",
+        "score": 2 if opposing else 1,
+    }
 
 
 def get_window_start_unix() -> int:
@@ -677,22 +812,24 @@ async def price_loop():
                     
                     # close previous window: mark history outcomes ONLY when the window has ended
                     if (ws.window_start is not None and ws.window_start != window_start
-                            and ws.last_signal and ws.price_to_beat and ws.last_price):
+                            and (ws.last_signal or ws.last_fade) and ws.price_to_beat and ws.last_price):
                         prev_start_unix = int(ws.window_start.timestamp())
                         final = await fetch_polymarket_close(client, symbol, prev_start_unix)
                         if final is None:
                             final = twap_final_minute(ws.series) or ws.last_price
                         open_p = ws.price_to_beat
                         actual = "UP" if final >= open_p else "DOWN"
-                        predicted = ws.last_signal.get("side")
                         paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
+                        prev_iso = ws.window_start.isoformat() if hasattr(ws.window_start, "isoformat") else str(ws.window_start)
                         for h in signal_history:
-                            if h.get("window_start") == (ws.window_start.isoformat() if hasattr(ws.window_start, "isoformat") else str(ws.window_start)) and h.get("symbol") == symbol.replace("USDT",""):
+                            if h.get("window_start") == prev_iso and h.get("symbol") == symbol.replace("USDT", ""):
+                                if h.get("result") in ("win", "loss"):
+                                    continue
+                                predicted = h.get("side")
                                 h["result"] = "win" if predicted == actual else "loss"
                                 h["final"] = final
                                 h["actual"] = actual
                                 h["move"] = round(final - open_p, 6)
-                                break
 
                     if (ws.window_start is not None and ws.window_start != window_start
                             and ws.early and ws.early.get("side") and ws.price_to_beat and ws.last_price):
@@ -756,34 +893,81 @@ async def price_loop():
                             ws.price_to_beat = price  # rare: only first seconds
                         ws.source = "chainlink" if ws.source.startswith("chainlink") or source_now == "chainlink" else ws.source
 
-                    if seconds_passed < CONFIRM_AT or ws.signal_sent:
-                        continue
+                    # --- normal momentum signal (once per window) ---
+                    if seconds_passed >= CONFIRM_AT and not ws.signal_sent:
+                        signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
+                        if is_strong_signal(signal):
+                            ws.signal_sent = True
+                            entry = {
+                                **signal,
+                                "type": "MOMENTUM",
+                                "symbol": symbol.replace("USDT", ""),
+                                "momentum_bps": signal.get("mom_short", 0),
+                                "price": price,
+                                "open": ws.price_to_beat,
+                                "time": datetime.now(timezone.utc).isoformat(),
+                                "window_start": window_start.isoformat(),
+                            }
+                            p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+                            p_side = None if p_up is None else (p_up if signal["side"] == "UP" else 1.0 - p_up)
+                            entry["model_p"] = round(p_side, 3) if p_side is not None else None
+                            ws.last_signal = entry
+                            signal_history.insert(0, entry)
+                            spawn(paper_open(client, symbol, signal["side"], start_unix, p_side))
+                            if len(signal_history) > 80:
+                                signal_history.pop()
+                            logger.info(
+                                f"SIGNAL {symbol} {signal['side']} conf={signal['confidence']} "
+                                f"score={signal.get('score')} lead={signal.get('lead_bps')} "
+                                f"mom={signal.get('mom_short')}"
+                            )
 
-                    signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
-                    if is_strong_signal(signal):
-                        ws.signal_sent = True
-                        entry = {
-                            **signal,
-                            "symbol": symbol.replace("USDT", ""),
-                            "momentum_bps": signal.get("mom_short", 0),
-                            "price": price,
-                            "open": ws.price_to_beat,
-                            "time": datetime.now(timezone.utc).isoformat(),
-                            "window_start": window_start.isoformat(),
-                        }
-                        p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
-                        p_side = None if p_up is None else (p_up if signal["side"] == "UP" else 1.0 - p_up)
-                        entry["model_p"] = round(p_side, 3) if p_side is not None else None
-                        ws.last_signal = entry
-                        signal_history.insert(0, entry)
-                        spawn(paper_open(client, symbol, signal["side"], start_unix, p_side))
-                        if len(signal_history) > 50:
-                            signal_history.pop()
-                        logger.info(
-                            f"SIGNAL {symbol} {signal['side']} conf={signal['confidence']} "
-                            f"score={signal.get('score')} lead={signal.get('lead_bps')} "
-                            f"mom={signal.get('mom_short')}"
-                        )
+                    # --- High-prob fade: watch Polymarket book when market is 96%+ ---
+                    if FADE_ENABLED and not ws.fade_sent and ws.price_to_beat is not None:
+                        time_left_now = WINDOW_SECONDS - seconds_passed
+                        # only fetch book while we are in the interesting time window
+                        if FADE_MIN_TIME_LEFT <= time_left_now <= FADE_MAX_TIME_LEFT:
+                            now_ts = datetime.now(timezone.utc).timestamp()
+                            # refresh market probs every ~3.5s to avoid hammering CLOB
+                            if now_ts - ws._mkt_fetch_ts >= 3.5:
+                                coin = symbol.replace("USDT", "")
+                                probs = await fetch_market_probs(client, coin, start_unix)
+                                ws._mkt_fetch_ts = now_ts
+                                if probs:
+                                    ws.market_p = {**probs, "ts": int(now_ts)}
+                            if ws.market_p:
+                                fade = generate_fade_signal(
+                                    ws.market_p, ws.price_to_beat, price, seconds_passed, ws.prices
+                                )
+                                if fade is not None:
+                                    ws.fade_sent = True
+                                    entry = {
+                                        **fade,
+                                        "symbol": symbol.replace("USDT", ""),
+                                        "price": price,
+                                        "open": ws.price_to_beat,
+                                        "time": datetime.now(timezone.utc).isoformat(),
+                                        "window_start": window_start.isoformat(),
+                                    }
+                                    # model_p for the fade side (what we believe)
+                                    p_up_m = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+                                    p_side = None if p_up_m is None else (
+                                        p_up_m if fade["side"] == "UP" else 1.0 - p_up_m
+                                    )
+                                    entry["model_p"] = round(p_side, 3) if p_side is not None else None
+                                    ws.last_fade = entry
+                                    # also store as last_signal so dashboard/history see it
+                                    if not ws.last_signal:
+                                        ws.last_signal = entry
+                                    signal_history.insert(0, entry)
+                                    spawn(paper_open(client, symbol, fade["side"], start_unix, p_side))
+                                    if len(signal_history) > 80:
+                                        signal_history.pop()
+                                    logger.info(
+                                        f"FADE {symbol} against {fade['high_side']}@{fade['high_p']:.2f} "
+                                        f"→ {fade['side']} conf={fade['confidence']} "
+                                        f"mom={fade.get('mom_short')} time_left={fade.get('time_left')}"
+                                    )
 
                 global_error = None if any_ok else "Немає цін"
                 await asyncio.sleep(1.5)
@@ -807,17 +991,22 @@ async def api_status(request):
         current = ws.last_price or ws.price_to_beat
         lead = ((current - ws.price_to_beat) / ws.price_to_beat) * 10000
         live = generate_signal(ws.price_to_beat, current, max(seconds_passed, CONFIRM_AT), ws.prices)
+        mp = ws.market_p or {}
         markets[name] = {
             "open": round(ws.price_to_beat, 4),
             "current": round(current, 4),
             "lead_bps": round(lead, 2),
             "signal_sent": ws.signal_sent,
+            "fade_sent": ws.fade_sent,
             "signal": ws.last_signal,
+            "fade": ws.last_fade,
             "live_side": live.get("side"),
             "live_confidence": live.get("confidence", 0),
             "live_score": live.get("score", 0),
             "early": ws.early,
             "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series)),
+            "market_p_up": mp.get("UP"),
+            "market_p_down": mp.get("DOWN"),
             "source": ws.source,
             "series": [[t, round(p, 4)] for t, p in ws.series],
             "twap60": (round(twap_last_seconds(ws.series), 4) if ws.series else None),
@@ -830,6 +1019,10 @@ async def api_status(request):
     losses = sum(1 for h in resolved if h["result"] == "loss")
     total_r = wins + losses
     win_rate = round(wins / total_r * 100, 1) if total_r else None
+    fade_resolved = [h for h in resolved if h.get("type") == "FADE_HIGH"]
+    fade_wins = sum(1 for h in fade_resolved if h["result"] == "win")
+    fade_losses = sum(1 for h in fade_resolved if h["result"] == "loss")
+    fade_total = fade_wins + fade_losses
 
     return JSONResponse({
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -837,10 +1030,12 @@ async def api_status(request):
         "seconds_passed": seconds_passed,
         "time_left": time_left,
         "confirm_at": CONFIRM_AT,
+        "fade_enabled": FADE_ENABLED,
+        "fade_min_prob": FADE_MIN_PROB,
         "error": global_error,
         "chainlink_live": {k.replace("USDT",""): v for k,v in live_chainlink.items()},
         "markets": markets,
-        "history": signal_history[:30],
+        "history": signal_history[:40],
         "early_stats": {
             "wins": sum(1 for e in early_history if e["result"] == "win"),
             "losses": sum(1 for e in early_history if e["result"] == "loss"),
@@ -851,6 +1046,9 @@ async def api_status(request):
             "wins": wins,
             "losses": losses,
             "win_rate": win_rate,
+            "fade_wins": fade_wins,
+            "fade_losses": fade_losses,
+            "fade_wr": round(fade_wins / fade_total * 100, 1) if fade_total else None,
         },
     })
 
@@ -1069,23 +1267,40 @@ function render(d){
     const m=d.markets[n];
     if(!m||m.status==="waiting"){body+=`<div class="mrow"><div>${n}</div><div>—</div><div>—</div><div class="bs bw">…</div></div>`;continue}
     let sh=`<span class="bs bw">очікування</span>`;
-    if(m.signal_sent&&m.signal){
+    if(m.fade_sent&&m.fade){
+      const s=m.fade.side;
+      const hp=m.fade.high_p!=null?Math.round(m.fade.high_p*100):"?";
+      sh=`<span class="bs ${s==="UP"?"bu":"bd"}" title="FADE проти ${m.fade.high_side}@${hp}%">FADE ${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.fade.confidence*100).toFixed(0)}%</span>`;
+    }else if(m.signal_sent&&m.signal){
       const s=m.signal.side;
       const sc=m.signal.score?` ${m.signal.score}/3`:"";
-      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
+      const tp=m.signal.type==="FADE_HIGH"?"FADE ":"";
+      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${tp}${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_side){
       sh=`<span class="bs bw">${m.live_side} ~${(m.live_confidence*100).toFixed(0)}%${m.model_p_up!=null?` · P${Math.round((m.live_side==="UP"?m.model_p_up:1-m.model_p_up)*100)}`:""}</span>`;
     }else if(m.early&&m.early.side){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
-    body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
+    // show Polymarket book prices when available
+    let mktp="";
+    if(m.market_p_up!=null||m.market_p_down!=null){
+      const u=m.market_p_up!=null?Math.round(m.market_p_up*100):"—";
+      const dn=m.market_p_down!=null?Math.round(m.market_p_down*100):"—";
+      mktp=` <span style="font-size:.68rem;color:var(--muted)">[${u}/${dn}¢]</span>`;
+    }
+    body+=`<div class="mrow"><div style="font-weight:600">${n}${mktp}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
   }
-  const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
-  body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз (одразу на старті вікна, низька впевненість, окрема статистика): <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}</div>`;
-  document.getElementById("mkt").innerHTML=body;
   const st=d.stats||{};
+  const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
+  body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз: <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}`;
+  if(d.fade_enabled){
+    const fw=st.fade_wins||0,fl=st.fade_losses||0,ft=fw+fl;
+    body+=` · <b>FADE</b> (≥${Math.round((d.fade_min_prob||0.96)*100)}%): <b>${fw}</b>/<b>${fl}</b>${ft&&st.fade_wr!=null?` · ${st.fade_wr}%`:""}`;
+  }
+  body+=`</div>`;
+  document.getElementById("mkt").innerHTML=body;
   if(st.win_rate!=null){
-    document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`;
+    document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`+(st.fade_wr!=null?`<span>FADE WR: <b>${st.fade_wr}%</b></span>`:"");
   }
   const h=d.history||[];
   if(h.length){
@@ -1094,9 +1309,10 @@ function render(d){
       const t=e.time?new Date(e.time).toLocaleTimeString():"—";
       const res=e.result==="win"?"✓":e.result==="loss"?"✗":"";
       const rc=e.result==="win"?"pos":e.result==="loss"?"neg":"";
-      const sc=e.score?` ${e.score}/3`:"";
+      const isFade=e.type==="FADE_HIGH";
+      const sc=isFade?` F@${e.high_p!=null?Math.round(e.high_p*100):"?"}`:(e.score?` ${e.score}/3`:"");
       const mv=e.move==null?null:e.move;
-      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
+      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${isFade?"F":""}${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
     }
     document.getElementById("hist").innerHTML=x;
   }
