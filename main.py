@@ -2,11 +2,12 @@
 """
 Polymarket 5m Signals
 Open + Now = Chainlink via Polymarket RTDS (wss://ws-live-data.polymarket.com)
-Fallback = Binance
+Signals are produced ONLY from fresh Chainlink ticks (that is what Polymarket settles on).
+If the Chainlink feed goes stale the coin is paused and the websocket is reconnected automatically.
 """
 
 import os
-import re
+import time
 import math
 import json
 import base64
@@ -34,14 +35,6 @@ PRICE_HISTORY_LEN = 60
 MIN_LEAD_BPS = 10.0        # stronger lead filter (was 8)
 MIN_MOM_SHORT = 4.0        # short momentum confirmation
 MIN_MOM_MED = 2.5          # medium momentum confirmation
-
-# --- High-prob fade (when market is 96%+ and often reverses) ---
-FADE_ENABLED = os.getenv("FADE_ENABLED", "1").strip() not in ("0", "false", "False", "no")
-FADE_MIN_PROB = float(os.getenv("FADE_MIN_PROB", "0.96"))       # start watching from this market price
-FADE_MIN_TIME_LEFT = int(os.getenv("FADE_MIN_TIME_LEFT", "40"))  # don't fade in last N seconds
-FADE_MAX_TIME_LEFT = int(os.getenv("FADE_MAX_TIME_LEFT", "150")) # ignore too-early spikes
-FADE_MIN_CONFIDENCE = float(os.getenv("FADE_MIN_CONFIDENCE", "0.70"))
-FADE_MOM_WEAK = float(os.getenv("FADE_MOM_WEAK", "2.5"))         # |mom_short| below this = weak confirmation
 
 # Chainlink symbol map for RTDS
 CHAINLINK_SYM = {
@@ -72,11 +65,6 @@ class WindowState:
         self.series: deque = deque(maxlen=400)  # (seconds_in_window, price) for chart
         self.early: Optional[dict] = None       # early (low-confidence) forecast made right at window start
         self.prev_tail: list = []                # last prices of the previous window (trend before the start)
-        # High-prob fade state
-        self.fade_sent: bool = False
-        self.last_fade: Optional[dict] = None
-        self.market_p: Optional[dict] = None    # {"UP": float, "DOWN": float, "ts": int}
-        self._mkt_fetch_ts: float = 0.0
 
     def reset(self, price: float, start: datetime, source: str = ""):
         self.price_to_beat = price
@@ -94,10 +82,6 @@ class WindowState:
         self.last_error = None
         self.source = source
         self.open_confirmed = False
-        self.fade_sent = False
-        self.last_fade = None
-        self.market_p = None
-        self._mkt_fetch_ts = 0.0
 
 
 state: Dict[str, WindowState] = {s: WindowState(s) for s in SYMBOLS}
@@ -235,124 +219,6 @@ def is_strong_signal(signal: dict) -> bool:
     return signal.get("confidence", 0) >= MIN_CONFIDENCE and signal.get("score", 0) >= 2
 
 
-async def fetch_market_probs(client: httpx.AsyncClient, coin: str, start_unix: int) -> Optional[dict]:
-    """Best ask for UP and DOWN tokens on the current 5m market. Returns {"UP": p, "DOWN": p} or None."""
-    slug = f"{coin.lower()}-updown-5m-{start_unix}"
-    try:
-        meta = await paper_market_meta(client, slug)
-        if not meta or not meta[0]:
-            return None
-        out: Dict[str, float] = {}
-        for side_name, want in (("UP", "up"), ("DOWN", "down")):
-            token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
-            if not token:
-                continue
-            r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=4.0)
-            book = r.json()
-            best = None
-            for x in (book.get("asks") or []):
-                try:
-                    p = float(x["price"])
-                    sz = float(x["size"])
-                except Exception:
-                    continue
-                if 0 < p <= 0.99 and sz > 0:
-                    if best is None or p < best:
-                        best = p
-            if best is not None:
-                out[side_name] = best
-        if "UP" in out or "DOWN" in out:
-            # fill missing side as complement when possible
-            if "UP" in out and "DOWN" not in out:
-                out["DOWN"] = round(1.0 - out["UP"], 4)
-            elif "DOWN" in out and "UP" not in out:
-                out["UP"] = round(1.0 - out["DOWN"], 4)
-            return out
-    except Exception as e:
-        logger.debug(f"fetch_market_probs {coin}: {e}")
-    return None
-
-
-def generate_fade_signal(
-    market_p: dict,
-    price_to_beat: float,
-    current_price: float,
-    seconds_passed: int,
-    prices: deque,
-) -> Optional[dict]:
-    """
-    Fade a side that the market prices at >= FADE_MIN_PROB when:
-    - time left is still meaningful (not last seconds, not too early)
-    - BTC momentum does NOT strongly confirm that high-prob side
-    Returns a signal dict with type=FADE_HIGH or None.
-    """
-    if not FADE_ENABLED or not market_p:
-        return None
-    time_left = WINDOW_SECONDS - seconds_passed
-    if time_left < FADE_MIN_TIME_LEFT or time_left > FADE_MAX_TIME_LEFT:
-        return None
-
-    p_up = market_p.get("UP")
-    p_down = market_p.get("DOWN")
-    high_side = None
-    high_p = 0.0
-    if p_up is not None and p_up >= FADE_MIN_PROB:
-        high_side, high_p = "UP", p_up
-    if p_down is not None and p_down >= FADE_MIN_PROB and p_down > high_p:
-        high_side, high_p = "DOWN", p_down
-    if high_side is None:
-        return None
-
-    fade_side = "DOWN" if high_side == "UP" else "UP"
-    lead_bps = ((current_price - price_to_beat) / price_to_beat) * 10000 if price_to_beat else 0.0
-    mom_short = momentum_bps(prices, lookback=12)
-    mom_med = momentum_bps(prices, lookback=25)
-
-    # Does real BTC momentum still strongly support the high-prob side?
-    if high_side == "UP":
-        strong_confirm = (lead_bps >= MIN_LEAD_BPS and mom_short >= MIN_MOM_SHORT) or mom_short >= (MIN_MOM_SHORT + 2)
-    else:
-        strong_confirm = (lead_bps <= -MIN_LEAD_BPS and mom_short <= -MIN_MOM_SHORT) or mom_short <= -(MIN_MOM_SHORT + 2)
-
-    if strong_confirm:
-        # Trend still supports the favourite — do not fade
-        return None
-
-    # Weak or opposing momentum → fade is more attractive
-    opposing = (high_side == "UP" and mom_short < -FADE_MOM_WEAK) or (high_side == "DOWN" and mom_short > FADE_MOM_WEAK)
-    weak = abs(mom_short) < FADE_MOM_WEAK
-
-    base = 0.70
-    if opposing:
-        base = 0.82
-    elif weak:
-        base = 0.74
-    # Higher market price → slightly higher fade confidence (more "overcooked")
-    overcook = min(max(high_p - FADE_MIN_PROB, 0) * 2.0, 0.08)
-    # More time left → a bit more room for reversal
-    time_boost = 0.04 if time_left >= 70 else (0.02 if time_left >= 50 else 0.0)
-    confidence = min(base + overcook + time_boost, 0.90)
-
-    if confidence < FADE_MIN_CONFIDENCE:
-        return None
-
-    return {
-        "side": fade_side,
-        "confidence": round(confidence, 3),
-        "type": "FADE_HIGH",
-        "high_side": high_side,
-        "high_p": round(high_p, 4),
-        "market_p_up": round(p_up, 4) if p_up is not None else None,
-        "market_p_down": round(p_down, 4) if p_down is not None else None,
-        "lead_bps": round(lead_bps, 2),
-        "mom_short": round(mom_short, 2),
-        "mom_med": round(mom_med, 2),
-        "time_left": time_left,
-        "reason": f"fade_{high_side}@{high_p:.2f}",
-        "score": 2 if opposing else 1,
-    }
-
-
 def get_window_start_unix() -> int:
     now = int(datetime.now(timezone.utc).timestamp())
     return now - (now % WINDOW_SECONDS)
@@ -360,20 +226,6 @@ def get_window_start_unix() -> int:
 
 def get_current_window_start() -> datetime:
     return datetime.fromtimestamp(get_window_start_unix(), tz=timezone.utc)
-
-
-async def fetch_binance(client: httpx.AsyncClient, symbol: str) -> Optional[float]:
-    for url in [
-        f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}",
-        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
-    ]:
-        try:
-            r = await client.get(url, timeout=4.0)
-            if r.status_code == 200:
-                return float(r.json()["price"])
-        except Exception:
-            continue
-    return None
 
 
 def twap_last_seconds(series, seconds: float = 60.0) -> Optional[float]:
@@ -725,60 +577,207 @@ paper_load()
 
 
 # ====================== RTDS Chainlink ======================
+RTDS_URL = "wss://ws-live-data.polymarket.com"
+CL_FRESH_SEC = 15.0           # Chainlink tick older than this = stale -> coin is paused (no signals)
+RTDS_DEAD_SEC = 15.0          # no Chainlink price at all for this long -> reconnect
+RTDS_SYMBOL_DEAD_SEC = 30.0   # a coin that was updating and then went silent this long -> reconnect
+live_chainlink_ts: Dict[str, float] = {}   # symbol -> time.monotonic() of the last tick
+
+
+async def rtds_session():
+    """One websocket session. Raises (-> reconnect) when the connection is dead OR silently stopped sending prices."""
+    async with websockets.connect(RTDS_URL, ping_interval=None, close_timeout=5, open_timeout=10) as ws:
+        # one subscription for ALL chainlink symbols (no filters) - most reliable
+        subs = [{"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}]
+        await ws.send(json.dumps({"action": "subscribe", "subscriptions": subs}))
+        logger.info("RTDS subscribed to Chainlink prices")
+
+        t_conn = time.monotonic()
+        last_ping = t_conn
+        last_data = t_conn          # last time a real Chainlink PRICE arrived (PONG does not count)
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            except asyncio.TimeoutError:
+                raw = None
+            now = time.monotonic()
+
+            if now - last_ping >= 5.0:
+                await asyncio.wait_for(ws.send("PING"), timeout=5.0)
+                last_ping = now
+
+            # watchdogs: a socket can stay "open" while the data stream is dead
+            if now - last_data > RTDS_DEAD_SEC:
+                raise RuntimeError(f"no Chainlink prices for {now - last_data:.0f}s")
+            for sym, ts in list(live_chainlink_ts.items()):
+                if now - max(ts, t_conn) > RTDS_SYMBOL_DEAD_SEC:
+                    raise RuntimeError(f"{sym} silent for {now - max(ts, t_conn):.0f}s")
+
+            if raw is None or raw == "PONG":
+                continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            topic = msg.get("topic") or ""
+            if "chainlink" not in topic:
+                continue
+            payload = msg.get("payload") or {}
+            sym = (payload.get("symbol") or "").lower()
+            val = payload.get("value")
+            if val is None and isinstance(payload.get("data"), list) and payload["data"]:
+                val = payload["data"][-1].get("value")  # initial snapshot
+            if val is None:
+                continue
+            usdt = SYM_FROM_CL.get(sym)
+            if not usdt:
+                continue
+            try:
+                price = float(val)
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            if usdt not in live_chainlink:
+                logger.info(f"RTDS first chainlink price {usdt}={price}")
+            live_chainlink[usdt] = price
+            live_chainlink_ts[usdt] = now
+            last_data = now
+
+
 async def rtds_loop():
-    """Subscribe to Polymarket RTDS Chainlink prices."""
-    url = "wss://ws-live-data.polymarket.com"
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
-                # one subscription for ALL chainlink symbols (no filters) - most reliable
-                subs = [{
-                    "topic": "crypto_prices_chainlink",
-                    "type": "*",
-                    "filters": "",
-                }]
-                await ws.send(json.dumps({"action": "subscribe", "subscriptions": subs}))
-                logger.info("RTDS subscribed to Chainlink prices")
-
-                async def ping():
-                    while True:
-                        await asyncio.sleep(5)
-                        try:
-                            await ws.send("PING")
-                        except Exception:
-                            break
-
-                ping_task = asyncio.create_task(ping())
-                try:
-                    async for raw in ws:
-                        if raw == "PONG":
-                            continue
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        topic = msg.get("topic") or ""
-                        if "chainlink" not in topic and topic != "crypto_prices_chainlink":
-                            continue
-                        payload = msg.get("payload") or {}
-                        sym = (payload.get("symbol") or "").lower()
-                        val = payload.get("value")
-                        if val is None and isinstance(payload.get("data"), list) and payload["data"]:
-                            val = payload["data"][-1].get("value")  # initial snapshot
-                        if val is None:
-                            continue
-                        usdt = SYM_FROM_CL.get(sym)
-                        if not usdt:
-                            continue
-                        price = float(val)
-                        if usdt not in live_chainlink:
-                            logger.info(f"RTDS first chainlink price {usdt}={price}")
-                        live_chainlink[usdt] = price
-                finally:
-                    ping_task.cancel()
+            await rtds_session()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning(f"RTDS reconnect in 3s: {e}")
-            await asyncio.sleep(3)
+            logger.warning(f"RTDS reconnect in 2s: {e!r}")
+        await asyncio.sleep(2)
+
+
+async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int, window_start: datetime) -> bool:
+    """One tick for one coin. Returns False if there is no fresh Chainlink price (coin paused)."""
+    ws = state[symbol]
+    price = live_chainlink.get(symbol)
+    tick = live_chainlink_ts.get(symbol)
+    if price is None or tick is None or time.monotonic() - tick > CL_FRESH_SEC:
+        ws.last_error = "chainlink stale"
+        return False
+    ws.last_error = None
+
+    # close previous window: mark history outcomes ONLY when the window has ended
+    if (ws.window_start is not None and ws.window_start != window_start
+            and ws.last_signal and ws.price_to_beat and ws.last_price):
+        prev_start_unix = int(ws.window_start.timestamp())
+        final = await fetch_polymarket_close(client, symbol, prev_start_unix)
+        if final is None:
+            final = twap_final_minute(ws.series) or ws.last_price
+        open_p = ws.price_to_beat
+        actual = "UP" if final >= open_p else "DOWN"
+        predicted = ws.last_signal.get("side")
+        paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
+        for h in signal_history:
+            if h.get("window_start") == ws.window_start.isoformat() and h.get("symbol") == symbol.replace("USDT", ""):
+                h["result"] = "win" if predicted == actual else "loss"
+                h["final"] = final
+                h["actual"] = actual
+                h["move"] = round(final - open_p, 6)
+                break
+
+    if (ws.window_start is not None and ws.window_start != window_start
+            and ws.early and ws.early.get("side") and ws.price_to_beat and ws.last_price):
+        try:
+            fin = await fetch_polymarket_close(client, symbol, int(ws.window_start.timestamp()))
+            if fin is None:
+                fin = twap_final_minute(ws.series) or ws.last_price
+            act = "UP" if fin >= ws.price_to_beat else "DOWN"
+            early_history.insert(0, {
+                "symbol": symbol.replace("USDT", ""), "side": ws.early["side"], "actual": act,
+                "result": "win" if ws.early["side"] == act else "loss",
+                "time": ws.early["time"], "move": round(fin - ws.price_to_beat, 6),
+            })
+            del early_history[300:]
+        except Exception as e:
+            logger.warning(f"early eval error: {e}")
+
+    # new window
+    if ws.window_start is None or ws.window_start != window_start:
+        await paper_settle_orphans(client, symbol, start_unix)
+        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
+        if pm_open is not None:
+            open_px, open_src = pm_open, "polymarket"
+        else:
+            open_px, open_src = live_chainlink.get(symbol, price), "chainlink"
+        ws.reset(open_px, window_start, source=open_src)
+        ws.open_confirmed = pm_open is not None
+        logger.info(f"[{symbol}] New window open={open_px:.4f} ({open_src})")
+        return True
+
+    # Polymarket open not available at window start yet -> keep retrying
+    if not ws.open_confirmed:
+        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
+        if pm_open is not None:
+            ws.price_to_beat = pm_open
+            ws.open_confirmed = True
+            ws.source = "polymarket"
+            logger.info(f"[{symbol}] Open set from Polymarket: {pm_open:.4f}")
+
+    # network calls above may have taken a while: re-read time and price
+    now_utc = datetime.now(timezone.utc)
+    seconds_passed = int((now_utc - window_start).total_seconds())
+    if seconds_passed >= WINDOW_SECONDS:
+        return True        # window just ended; the next tick will open the new one
+    price = live_chainlink.get(symbol, price)
+
+    # update live
+    ws.prices.append(price)
+    ws.last_price = price
+
+    # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
+    if ws.early is None and seconds_passed >= 3:
+        seq = list(ws.prev_tail) + list(ws.prices)
+        side_e, mom_e = None, 0.0
+        if len(seq) >= 12:
+            ref = seq[-min(len(seq), 25)]
+            mom_e = (seq[-1] - ref) / ref * 10000
+            if abs(mom_e) >= 0.5:
+                side_e = "UP" if mom_e > 0 else "DOWN"
+        ws.early = {"side": side_e, "mom_bps": round(mom_e, 2), "time": now_utc.isoformat()}
+    ws.series.append((round((now_utc - ws.window_start).total_seconds(), 1), price))
+    ws.last_update = now_utc
+
+    if seconds_passed < CONFIRM_AT or ws.signal_sent:
+        return True
+
+    signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
+    if is_strong_signal(signal):
+        ws.signal_sent = True
+        entry = {
+            **signal,
+            "symbol": symbol.replace("USDT", ""),
+            "momentum_bps": signal.get("mom_short", 0),
+            "price": price,
+            "open": ws.price_to_beat,
+            "time": now_utc.isoformat(),
+            "window_start": window_start.isoformat(),
+        }
+        p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+        p_side = None if p_up is None else (p_up if signal["side"] == "UP" else 1.0 - p_up)
+        entry["model_p"] = round(p_side, 3) if p_side is not None else None
+        ws.last_signal = entry
+        signal_history.insert(0, entry)
+        spawn(paper_open(client, symbol, signal["side"], start_unix, p_side))
+        if len(signal_history) > 50:
+            signal_history.pop()
+        logger.info(
+            f"SIGNAL {symbol} {signal['side']} conf={signal['confidence']} "
+            f"score={signal.get('score')} lead={signal.get('lead_bps')} "
+            f"mom={signal.get('mom_short')}"
+        )
+    return True
 
 
 async def price_loop():
@@ -788,193 +787,54 @@ async def price_loop():
             try:
                 start_unix = get_window_start_unix()
                 window_start = get_current_window_start()
-                seconds_passed = int((datetime.now(timezone.utc) - window_start).total_seconds())
+                # all coins in parallel: a slow Polymarket call for one coin must not delay the others
+                results = await asyncio.wait_for(
+                    asyncio.gather(*(process_symbol(client, s, start_unix, window_start) for s in SYMBOLS),
+                                   return_exceptions=True),
+                    timeout=20.0,
+                )
                 any_ok = False
-
-                for symbol in SYMBOLS:
-                    ws = state[symbol]
-
-                    # prefer Chainlink live price
-                    price = live_chainlink.get(symbol)
-                    source_now = "chainlink"
-                    if price is None:
-                        price = await fetch_binance(client, symbol)
-                        source_now = "binance"
-
-                    if price is None:
-                        ws.last_error = "no price"
-                        continue
-
-                    any_ok = True
-                    ws.last_error = None
-
-                    # new window
-                    
-                    # close previous window: mark history outcomes ONLY when the window has ended
-                    if (ws.window_start is not None and ws.window_start != window_start
-                            and (ws.last_signal or ws.last_fade) and ws.price_to_beat and ws.last_price):
-                        prev_start_unix = int(ws.window_start.timestamp())
-                        final = await fetch_polymarket_close(client, symbol, prev_start_unix)
-                        if final is None:
-                            final = twap_final_minute(ws.series) or ws.last_price
-                        open_p = ws.price_to_beat
-                        actual = "UP" if final >= open_p else "DOWN"
-                        paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
-                        prev_iso = ws.window_start.isoformat() if hasattr(ws.window_start, "isoformat") else str(ws.window_start)
-                        for h in signal_history:
-                            if h.get("window_start") == prev_iso and h.get("symbol") == symbol.replace("USDT", ""):
-                                if h.get("result") in ("win", "loss"):
-                                    continue
-                                predicted = h.get("side")
-                                h["result"] = "win" if predicted == actual else "loss"
-                                h["final"] = final
-                                h["actual"] = actual
-                                h["move"] = round(final - open_p, 6)
-
-                    if (ws.window_start is not None and ws.window_start != window_start
-                            and ws.early and ws.early.get("side") and ws.price_to_beat and ws.last_price):
-                        try:
-                            fin = await fetch_polymarket_close(client, symbol, int(ws.window_start.timestamp()))
-                            if fin is None:
-                                fin = twap_final_minute(ws.series) or ws.last_price
-                            act = "UP" if fin >= ws.price_to_beat else "DOWN"
-                            early_history.insert(0, {
-                                "symbol": symbol.replace("USDT", ""), "side": ws.early["side"], "actual": act,
-                                "result": "win" if ws.early["side"] == act else "loss",
-                                "time": ws.early["time"], "move": round(fin - ws.price_to_beat, 6),
-                            })
-                            del early_history[300:]
-                        except Exception as e:
-                            logger.warning(f"early eval error: {e}")
-
-                    if ws.window_start is None or ws.window_start != window_start:
-                        await paper_settle_orphans(client, symbol, start_unix)
-                        # capture open from Chainlink if available, else binance
-                        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
-                        if pm_open is not None:
-                            open_px, open_src = pm_open, "polymarket"
-                        else:
-                            open_px = live_chainlink.get(symbol) or price
-                            open_src = "chainlink" if symbol in live_chainlink else "binance-fallback"
-                        ws.reset(open_px, window_start, source=open_src)
-                        ws.open_confirmed = pm_open is not None
-                        logger.info(f"[{symbol}] New window open={open_px:.4f} ({open_src})")
-                        continue
-
-                    # Polymarket open not available at window start yet -> keep retrying
-                    if not ws.open_confirmed:
-                        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
-                        if pm_open is not None:
-                            ws.price_to_beat = pm_open
-                            ws.open_confirmed = True
-                            ws.source = "polymarket"
-                            logger.info(f"[{symbol}] Open set from Polymarket: {pm_open:.4f}")
-
-                    # update live
-                    ws.prices.append(price)
-                    ws.last_price = price
-
-                    # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
-                    if ws.early is None and seconds_passed >= 3:
-                        seq = list(ws.prev_tail) + list(ws.prices)
-                        side_e, mom_e = None, 0.0
-                        if len(seq) >= 12:
-                            ref = seq[-min(len(seq), 25)]
-                            mom_e = (seq[-1] - ref) / ref * 10000
-                            if abs(mom_e) >= 0.5:
-                                side_e = "UP" if mom_e > 0 else "DOWN"
-                        ws.early = {"side": side_e, "mom_bps": round(mom_e, 2),
-                                    "time": datetime.now(timezone.utc).isoformat()}
-                    ws.series.append((round((datetime.now(timezone.utc) - ws.window_start).total_seconds(), 1), price))
-                    ws.last_update = datetime.now(timezone.utc)
-                    if source_now == "chainlink" and ws.source != "chainlink" and not ws.open_confirmed:
-                        # upgrade open if we only had binance at start and still early
-                        if seconds_passed < 15 and ws.source.startswith("binance"):
-                            ws.price_to_beat = price  # rare: only first seconds
-                        ws.source = "chainlink" if ws.source.startswith("chainlink") or source_now == "chainlink" else ws.source
-
-                    # --- normal momentum signal (once per window) ---
-                    if seconds_passed >= CONFIRM_AT and not ws.signal_sent:
-                        signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
-                        if is_strong_signal(signal):
-                            ws.signal_sent = True
-                            entry = {
-                                **signal,
-                                "type": "MOMENTUM",
-                                "symbol": symbol.replace("USDT", ""),
-                                "momentum_bps": signal.get("mom_short", 0),
-                                "price": price,
-                                "open": ws.price_to_beat,
-                                "time": datetime.now(timezone.utc).isoformat(),
-                                "window_start": window_start.isoformat(),
-                            }
-                            p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
-                            p_side = None if p_up is None else (p_up if signal["side"] == "UP" else 1.0 - p_up)
-                            entry["model_p"] = round(p_side, 3) if p_side is not None else None
-                            ws.last_signal = entry
-                            signal_history.insert(0, entry)
-                            spawn(paper_open(client, symbol, signal["side"], start_unix, p_side))
-                            if len(signal_history) > 80:
-                                signal_history.pop()
-                            logger.info(
-                                f"SIGNAL {symbol} {signal['side']} conf={signal['confidence']} "
-                                f"score={signal.get('score')} lead={signal.get('lead_bps')} "
-                                f"mom={signal.get('mom_short')}"
-                            )
-
-                    # --- High-prob fade: watch Polymarket book when market is 96%+ ---
-                    if FADE_ENABLED and not ws.fade_sent and ws.price_to_beat is not None:
-                        time_left_now = WINDOW_SECONDS - seconds_passed
-                        # only fetch book while we are in the interesting time window
-                        if FADE_MIN_TIME_LEFT <= time_left_now <= FADE_MAX_TIME_LEFT:
-                            now_ts = datetime.now(timezone.utc).timestamp()
-                            # refresh market probs every ~3.5s to avoid hammering CLOB
-                            if now_ts - ws._mkt_fetch_ts >= 3.5:
-                                coin = symbol.replace("USDT", "")
-                                probs = await fetch_market_probs(client, coin, start_unix)
-                                ws._mkt_fetch_ts = now_ts
-                                if probs:
-                                    ws.market_p = {**probs, "ts": int(now_ts)}
-                            if ws.market_p:
-                                fade = generate_fade_signal(
-                                    ws.market_p, ws.price_to_beat, price, seconds_passed, ws.prices
-                                )
-                                if fade is not None:
-                                    ws.fade_sent = True
-                                    entry = {
-                                        **fade,
-                                        "symbol": symbol.replace("USDT", ""),
-                                        "price": price,
-                                        "open": ws.price_to_beat,
-                                        "time": datetime.now(timezone.utc).isoformat(),
-                                        "window_start": window_start.isoformat(),
-                                    }
-                                    # model_p for the fade side (what we believe)
-                                    p_up_m = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
-                                    p_side = None if p_up_m is None else (
-                                        p_up_m if fade["side"] == "UP" else 1.0 - p_up_m
-                                    )
-                                    entry["model_p"] = round(p_side, 3) if p_side is not None else None
-                                    ws.last_fade = entry
-                                    # also store as last_signal so dashboard/history see it
-                                    if not ws.last_signal:
-                                        ws.last_signal = entry
-                                    signal_history.insert(0, entry)
-                                    spawn(paper_open(client, symbol, fade["side"], start_unix, p_side))
-                                    if len(signal_history) > 80:
-                                        signal_history.pop()
-                                    logger.info(
-                                        f"FADE {symbol} against {fade['high_side']}@{fade['high_p']:.2f} "
-                                        f"→ {fade['side']} conf={fade['confidence']} "
-                                        f"mom={fade.get('mom_short')} time_left={fade.get('time_left')}"
-                                    )
-
-                global_error = None if any_ok else "Немає цін"
-                await asyncio.sleep(1.5)
+                for s, r in zip(SYMBOLS, results):
+                    if isinstance(r, BaseException):
+                        logger.error(f"process {s}: {r!r}")
+                    elif r:
+                        any_ok = True
+                global_error = None if any_ok else "Chainlink: немає свіжих цін"
+                await asyncio.sleep(1.5)      # keep 1.5s: momentum thresholds are tuned for this tick spacing
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                global_error = str(e)
-                logger.error(f"Loop: {e}")
+                global_error = str(e) or type(e).__name__
+                logger.error(f"Loop: {global_error}")
                 await asyncio.sleep(5)
+
+
+async def supervise(name: str, fn):
+    """Restart a background loop if it ever dies."""
+    while True:
+        try:
+            await fn()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"{name} crashed, restarting in 2s: {e!r}")
+            await asyncio.sleep(2)
+
+
+async def keepalive_loop():
+    """Render free sleeps after 15 min without inbound HTTP. Ping our own public URL so it never sleeps."""
+    base = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not base:
+        return
+    logger.info(f"keepalive -> {base}/health every 4 min")
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        while True:
+            await asyncio.sleep(240)
+            try:
+                await c.get(base + "/health")
+            except Exception as e:
+                logger.debug(f"keepalive: {e}")
 
 
 async def api_status(request):
@@ -991,23 +851,19 @@ async def api_status(request):
         current = ws.last_price or ws.price_to_beat
         lead = ((current - ws.price_to_beat) / ws.price_to_beat) * 10000
         live = generate_signal(ws.price_to_beat, current, max(seconds_passed, CONFIRM_AT), ws.prices)
-        mp = ws.market_p or {}
         markets[name] = {
             "open": round(ws.price_to_beat, 4),
             "current": round(current, 4),
             "lead_bps": round(lead, 2),
             "signal_sent": ws.signal_sent,
-            "fade_sent": ws.fade_sent,
             "signal": ws.last_signal,
-            "fade": ws.last_fade,
             "live_side": live.get("side"),
             "live_confidence": live.get("confidence", 0),
             "live_score": live.get("score", 0),
             "early": ws.early,
             "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series)),
-            "market_p_up": mp.get("UP"),
-            "market_p_down": mp.get("DOWN"),
             "source": ws.source,
+            "stale": bool(ws.last_error),
             "series": [[t, round(p, 4)] for t, p in ws.series],
             "twap60": (round(twap_last_seconds(ws.series), 4) if ws.series else None),
             "updated": ws.last_update.isoformat() if ws.last_update else None,
@@ -1019,10 +875,6 @@ async def api_status(request):
     losses = sum(1 for h in resolved if h["result"] == "loss")
     total_r = wins + losses
     win_rate = round(wins / total_r * 100, 1) if total_r else None
-    fade_resolved = [h for h in resolved if h.get("type") == "FADE_HIGH"]
-    fade_wins = sum(1 for h in fade_resolved if h["result"] == "win")
-    fade_losses = sum(1 for h in fade_resolved if h["result"] == "loss")
-    fade_total = fade_wins + fade_losses
 
     return JSONResponse({
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -1030,12 +882,10 @@ async def api_status(request):
         "seconds_passed": seconds_passed,
         "time_left": time_left,
         "confirm_at": CONFIRM_AT,
-        "fade_enabled": FADE_ENABLED,
-        "fade_min_prob": FADE_MIN_PROB,
         "error": global_error,
         "chainlink_live": {k.replace("USDT",""): v for k,v in live_chainlink.items()},
         "markets": markets,
-        "history": signal_history[:40],
+        "history": signal_history[:30],
         "early_stats": {
             "wins": sum(1 for e in early_history if e["result"] == "win"),
             "losses": sum(1 for e in early_history if e["result"] == "loss"),
@@ -1046,15 +896,14 @@ async def api_status(request):
             "wins": wins,
             "losses": losses,
             "win_rate": win_rate,
-            "fade_wins": fade_wins,
-            "fade_losses": fade_losses,
-            "fade_wr": round(fade_wins / fade_total * 100, 1) if fade_total else None,
         },
     })
 
 
 async def health(request):
-    return JSONResponse({"ok": True, "chainlink": list(live_chainlink.keys())})
+    now = time.monotonic()
+    return JSONResponse({"ok": True, "chainlink": list(live_chainlink.keys()),
+                         "tick_age_sec": {k.replace("USDT", ""): round(now - v, 1) for k, v in live_chainlink_ts.items()}})
 
 
 # HTML — same dashboard (compact)
@@ -1162,10 +1011,8 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="scroll" id="wbody" style="color:var(--muted);font-size:.85rem">Завантаження…</div>
 </div>
 <div class="sheet" id="vtop">
-  <h3>Найуспішніші трейдери · крипто</h3>
-  <div class="ctabs" id="tmode"><button data-m="top">Топ прибуток</button><button data-m="clean">Без програшів</button></div>
-  <div class="ctabs" id="lchips" style="display:none;margin-top:8px"><button data-l="0">0 програшів</button><button data-l="1">≤ 1</button><button data-l="2">≤ 2</button><button data-l="3">≤ 3</button></div>
-  <div class="ctabs" id="ttabs" style="margin-top:8px"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
+  <h3>Найуспішніші трейдери · крипто (за прибутком)</h3>
+  <div class="ctabs" id="ttabs" style="margin-top:4px"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
   <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
 </div>
 <div class="sheet" id="vpap">
@@ -1267,40 +1114,25 @@ function render(d){
     const m=d.markets[n];
     if(!m||m.status==="waiting"){body+=`<div class="mrow"><div>${n}</div><div>—</div><div>—</div><div class="bs bw">…</div></div>`;continue}
     let sh=`<span class="bs bw">очікування</span>`;
-    if(m.fade_sent&&m.fade){
-      const s=m.fade.side;
-      const hp=m.fade.high_p!=null?Math.round(m.fade.high_p*100):"?";
-      sh=`<span class="bs ${s==="UP"?"bu":"bd"}" title="FADE проти ${m.fade.high_side}@${hp}%">FADE ${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.fade.confidence*100).toFixed(0)}%</span>`;
+    if(m.stale){
+      sh=`<span class="bs bw" title="Chainlink не оновлюється, чекаю на перепідключення">нема даних</span>`;
     }else if(m.signal_sent&&m.signal){
       const s=m.signal.side;
       const sc=m.signal.score?` ${m.signal.score}/3`:"";
-      const tp=m.signal.type==="FADE_HIGH"?"FADE ":"";
-      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${tp}${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
+      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_side){
       sh=`<span class="bs bw">${m.live_side} ~${(m.live_confidence*100).toFixed(0)}%${m.model_p_up!=null?` · P${Math.round((m.live_side==="UP"?m.model_p_up:1-m.model_p_up)*100)}`:""}</span>`;
     }else if(m.early&&m.early.side){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
-    // show Polymarket book prices when available
-    let mktp="";
-    if(m.market_p_up!=null||m.market_p_down!=null){
-      const u=m.market_p_up!=null?Math.round(m.market_p_up*100):"—";
-      const dn=m.market_p_down!=null?Math.round(m.market_p_down*100):"—";
-      mktp=` <span style="font-size:.68rem;color:var(--muted)">[${u}/${dn}¢]</span>`;
-    }
-    body+=`<div class="mrow"><div style="font-weight:600">${n}${mktp}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
+    body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
   }
-  const st=d.stats||{};
   const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
-  body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз: <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}`;
-  if(d.fade_enabled){
-    const fw=st.fade_wins||0,fl=st.fade_losses||0,ft=fw+fl;
-    body+=` · <b>FADE</b> (≥${Math.round((d.fade_min_prob||0.96)*100)}%): <b>${fw}</b>/<b>${fl}</b>${ft&&st.fade_wr!=null?` · ${st.fade_wr}%`:""}`;
-  }
-  body+=`</div>`;
+  body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз (одразу на старті вікна, низька впевненість, окрема статистика): <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}</div>`;
   document.getElementById("mkt").innerHTML=body;
+  const st=d.stats||{};
   if(st.win_rate!=null){
-    document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`+(st.fade_wr!=null?`<span>FADE WR: <b>${st.fade_wr}%</b></span>`:"");
+    document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`;
   }
   const h=d.history||[];
   if(h.length){
@@ -1309,10 +1141,9 @@ function render(d){
       const t=e.time?new Date(e.time).toLocaleTimeString():"—";
       const res=e.result==="win"?"✓":e.result==="loss"?"✗":"";
       const rc=e.result==="win"?"pos":e.result==="loss"?"neg":"";
-      const isFade=e.type==="FADE_HIGH";
-      const sc=isFade?` F@${e.high_p!=null?Math.round(e.high_p*100):"?"}`:(e.score?` ${e.score}/3`:"");
+      const sc=e.score?` ${e.score}/3`:"";
       const mv=e.move==null?null:e.move;
-      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${isFade?"F":""}${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
+      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
     }
     document.getElementById("hist").innerHTML=x;
   }
@@ -1358,38 +1189,12 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     }catch(e){data={ok:false,error:'Не вдалося завантажити'}}
     draw();
   }
-  let tmode='top',tloss=0,ttimer=null;
+  let ttimer=null;
   async function loadT(){
     clearTimeout(ttimer);
-    document.querySelectorAll('#tmode button').forEach(x=>{x.className=x.dataset.m===tmode?'on':''});
-    document.querySelectorAll('#lchips button').forEach(x=>{x.className=(+x.dataset.l===tloss)?'on':''});
-    document.getElementById('lchips').style.display=tmode==='clean'?'flex':'none';
-    document.querySelectorAll('#ttabs button').forEach(x=>{
-      x.className=x.dataset.p===tper?'on':'';
-      x.style.display=(tmode==='clean'&&x.dataset.p==='month')?'none':'';
-    });
+    document.querySelectorAll('#ttabs button').forEach(x=>{x.className=x.dataset.p===tper?'on':''});
     const b=document.getElementById('tbody');
     try{
-      if(tmode==='clean'){
-        const per=tper==='month'?'week':tper;
-        const d=await (await fetch('/api/clean?period='+per)).json();
-        const rows=(d.rows||[]).filter(w=>w.losses<=tloss);
-        let x='';
-        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (результати з'являються по мірі перевірки, повний прохід може тривати до 25 хв)</div>"}
-        if(d.status==='error'){x+="<div style='color:var(--down);margin-bottom:8px'>"+esc(d.error||'Помилка')+"</div>"}
-        for(const w of rows){
-          const c=w.pnl>=0?'var(--up)':'var(--down)';
-          x+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><span>"+who(w)+"</span><b style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+usd(w.pnl)+"</b></div><div class='sub'>Виграшів "+w.wins+" · програшів "+w.losses+" · позицій "+w.n+"</div></div>";
-        }
-        if(!rows.length&&d.status!=='loading'&&d.status!=='error')x+="<div style='color:var(--muted)'>Немає гаманців з такою кількістю програшів за цей період</div>";
-        if(d.status==='ready'&&d.partial){x+="<div style='font-size:.72rem;color:var(--muted);margin-top:8px'>Перевірку зупинено за часом: не встигли "+d.partial+" гаманців.</div>"}
-        if(d.status==='ready'||(d.rows&&d.rows.length)){
-          x+="<div style='font-size:.7rem;color:var(--muted);margin-top:12px;line-height:1.4'>Період: "+(per==='day'?'останні 24 год':'останні 7 днів')+". Перевіряються топ-"+(d.total||40)+" крипто-гаманців за прибутком; враховані закриті позиції"+(d.scope_all?' (всі крипто-ринки: Polymarket не віддав тип ринку)':' на 5-хв ринках BTC/ETH/SOL/XRP')+". Гаманці з надто великою кількістю угод пропущені, бо їх неможливо перевірити повністю"+(d.incomplete?': '+d.incomplete:'')+". Минулі результати не гарантують майбутніх.</div>";
-        }
-        b.innerHTML=x;
-        if(d.status==='loading')ttimer=setTimeout(loadT,3000);
-        return;
-      }
       const r=await fetch('/api/top?period='+tper);
       const d=await r.json();
       if(!d.ok){b.innerHTML=esc(d.error||'Помилка');return}
@@ -1503,8 +1308,6 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
   document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
   document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
-  document.getElementById('tmode').onclick=e=>{const mm=e.target.dataset&&e.target.dataset.m;if(mm){tmode=mm;if(mm==='clean'&&tper==='month')tper='day';loadT()}};
-  document.getElementById('lchips').onclick=e=>{const l=e.target.dataset&&e.target.dataset.l;if(l!==undefined&&l!==''){tloss=+l;loadT()}};
 })();
 refresh();setInterval(refresh,2000);
 </script>
@@ -1517,8 +1320,9 @@ async def dashboard(request):
 
 
 async def on_startup():
-    asyncio.create_task(rtds_loop())
-    asyncio.create_task(price_loop())
+    spawn(supervise("rtds", rtds_loop))
+    spawn(supervise("price", price_loop))
+    spawn(keepalive_loop())
     logger.info("RTDS + price loops started")
 
 
@@ -1870,231 +1674,6 @@ async def api_paper_reset(request):
     return JSONResponse(await _paper_payload())
 
 
-# ====================== Wallets without losses ======================
-_clean: Dict[str, dict] = {}
-CLEAN_CANDIDATES = 1000     # how many top-profit crypto wallets we check (1000 = max the leaderboard returns)
-CLEAN_MIN_POSITIONS = 5     # ignore wallets with fewer closed positions in the period
-CLEAN_MAX_PAGES = 6         # pages per wallet and status (200 rows each); beyond that the data is "incomplete"
-CLEAN_WALLET_TIMEOUT = 45   # seconds per wallet; slower ones are skipped
-CLEAN_TTL = 1800
-CLEAN_TOTAL_TIMEOUT = 1500   # stop the scan after 25 min and show what we have
-_UPDOWN_RE = re.compile(r"(btc|eth|sol|xrp)-updown-5m-")
-
-
-def _g(t, *keys, default=None):
-    for k in keys:
-        if isinstance(t, dict) and k in t and t[k] is not None:
-            return t[k]
-    return default
-
-
-def _to_ts(v) -> int:
-    if v is None:
-        return 0
-    try:
-        x = int(float(v))
-    except Exception:
-        try:
-            return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
-        except Exception:
-            return 0
-    return x // 1000 if x > 10**11 else x
-
-
-async def _fetch_leaderboard(c: httpx.AsyncClient, period: str, limit: int):
-    attempts = [
-        ("https://data-api.polymarket.com/v2/leaderboard",
-         {"time_period": period, "category": "crypto", "sort_by": "PNL", "limit": limit}),
-        ("https://data-api.polymarket.com/v1/leaderboard",
-         {"timePeriod": period.upper(), "category": "CRYPTO", "orderBy": "PNL", "limit": limit}),
-    ]
-    err = ""
-    for url, params in attempts:
-        try:
-            r = await c.get(url, params=params)
-            body = r.json()
-        except Exception as e:
-            err = str(e)[:100]
-            continue
-        if r.status_code == 200:
-            data = body.get("data") if isinstance(body, dict) else body
-            if isinstance(data, dict):
-                data = next((v for v in data.values() if isinstance(v, list)), [])
-            if isinstance(data, list):
-                out = []
-                for t in data:
-                    if not isinstance(t, dict):
-                        continue
-                    w = _g(t, "user_id", "proxy_wallet", "proxyWallet", "address", "wallet", default="")
-                    if w:
-                        out.append({"wallet": w, "name": _g(t, "user_name", "userName", "name", "pseudonym", default="")})
-                return out, ""
-        err = f"{r.status_code} {str(body)[:120]}"
-    return [], err
-
-
-async def _get_retry(c: httpx.AsyncClient, url: str, params: dict):
-    """GET with a short back-off when Polymarket answers 429 (rate limited)."""
-    r = None
-    for _ in range(3):
-        r = await c.get(url, params=params)
-        if r.status_code != 429:
-            return r
-        try:
-            wait = float(r.headers.get("Retry-After", 2))
-        except Exception:
-            wait = 2.0
-        await asyncio.sleep(min(max(wait, 1.0), 8.0))
-    return r
-
-
-async def _wallet_window_stats(c: httpx.AsyncClient, wallet: str, since_ts: int):
-    """Wins/losses of a wallet on closed 5m crypto positions since since_ts.
-    Returns None if data could not be read; 'complete': False if there were too many rows to verify."""
-    wins = losses = n = 0
-    pnl = 0.0
-    complete = True
-    scope_all = False
-    for status in ("CLOSED", "REDEEMABLE_LOST"):
-        cursor = None
-        pages = 0
-        while True:
-            if cursor:
-                params = {"user": wallet, "cursor": cursor}
-            else:
-                params = {"user": wallet, "status": status, "sort_by": "TIMESTAMP",
-                          "sort_direction": "DESC", "limit": 200}
-            r = await _get_retry(c, "https://data-api.polymarket.com/v2/positions", params)
-            if r.status_code != 200:
-                return None
-            body = r.json()
-            rows = body.get("data") if isinstance(body, dict) else body
-            if not isinstance(rows, list):
-                return None
-            oldest = None
-            for row in rows:
-                ts = _to_ts(_g(row, "last_event_at", "timestamp", "updated_at"))
-                if ts:
-                    oldest = ts if oldest is None else min(oldest, ts)
-                if ts and ts < since_ts:
-                    continue
-                slug = _g(row, "slug", "market_slug", "event_slug", "eventSlug")
-                if slug is not None:
-                    if not _UPDOWN_RE.search(str(slug).lower()):
-                        continue
-                else:
-                    scope_all = True
-                try:
-                    rp = float(_g(row, "realized_pnl", "realizedPnl", default=0) or 0)
-                except Exception:
-                    rp = 0.0
-                n += 1
-                pnl += rp
-                if status == "REDEEMABLE_LOST" or rp < -0.01:
-                    losses += 1
-                elif rp > 0.01:
-                    wins += 1
-            pg = (body.get("pagination") or {}) if isinstance(body, dict) else {}
-            nxt = pg.get("next_cursor")
-            if not rows or not nxt or (oldest is not None and oldest < since_ts):
-                break
-            pages += 1
-            if pages >= CLEAN_MAX_PAGES:
-                complete = False
-                break
-            cursor = nxt
-    return {"wins": wins, "losses": losses, "n": n, "pnl": round(pnl, 2),
-            "complete": complete, "scope_all": scope_all}
-
-
-async def _clean_compute(period: str):
-    st = _clean[period]
-    st["status"] = "loading"
-    st["progress"] = 0
-    st["error"] = ""
-    now = int(datetime.now(timezone.utc).timestamp())
-    since = now - (86400 if period == "day" else 7 * 86400)
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as c:
-            cands, err = await _fetch_leaderboard(c, period, CLEAN_CANDIDATES)
-            if not cands:
-                st["status"] = "error"
-                st["error"] = f"Не вдалося отримати кандидатів: {err or 'порожній список'}"
-                st["ts"] = int(datetime.now(timezone.utc).timestamp())
-                return
-            st["total"] = len(cands)
-            sem = asyncio.Semaphore(10)
-            logger.info(f"clean[{period}]: checking {len(cands)} wallets")
-            results = []
-            incomplete = 0
-            failed = 0
-            scope_all = False
-
-            async def one(cd):
-                nonlocal incomplete, failed, scope_all
-                async with sem:
-                    try:
-                        res = await asyncio.wait_for(_wallet_window_stats(c, cd["wallet"], since), CLEAN_WALLET_TIMEOUT)
-                    except Exception as e:
-                        logger.warning(f"clean stats {cd['wallet'][:8]}: {e}")
-                        res = None
-                st["progress"] += 1
-                if st["progress"] % 10 == 0:
-                    logger.info(f"clean[{period}]: {st['progress']}/{len(cands)} done")
-                if res is None:
-                    failed += 1
-                    return
-                if res["scope_all"]:
-                    scope_all = True
-                if not res["complete"]:
-                    incomplete += 1
-                    return
-                if res["n"] >= CLEAN_MIN_POSITIONS and res["losses"] <= 3:
-                    results.append({"wallet": cd["wallet"], "name": cd["name"], **res})
-                    st["rows"] = sorted(results, key=lambda r: r["pnl"], reverse=True)   # show results as they come
-                st["incomplete"] = incomplete
-                st["failed"] = failed
-
-            tasks = [asyncio.create_task(one(cd)) for cd in cands]
-            _, pending = await asyncio.wait(tasks, timeout=CLEAN_TOTAL_TIMEOUT)
-            for p in pending:
-                p.cancel()
-            st["partial"] = len(pending)
-            results.sort(key=lambda r: r["pnl"], reverse=True)
-            st["rows"] = results
-            st["incomplete"] = incomplete
-            st["failed"] = failed
-            st["scope_all"] = scope_all
-            st["ts"] = int(datetime.now(timezone.utc).timestamp())
-            if failed and failed == len(cands):
-                st["status"] = "error"
-                st["error"] = "Polymarket не віддав історію позицій гаманців"
-            else:
-                st["status"] = "ready"
-    except Exception as e:
-        logger.warning(f"_clean_compute error: {e}")
-        st["status"] = "error"
-        st["error"] = "Помилка під час підрахунку"
-        st["ts"] = int(datetime.now(timezone.utc).timestamp())
-
-
-async def api_clean(request):
-    period = (request.query_params.get("period") or "day").lower()
-    if period not in ("day", "week"):
-        period = "day"
-    now = int(datetime.now(timezone.utc).timestamp())
-    st = _clean.get(period)
-    if st is None:
-        st = _clean[period] = {"status": "loading", "ts": 0, "rows": [], "progress": 0, "total": CLEAN_CANDIDATES,
-                               "incomplete": 0, "failed": 0, "scope_all": False, "error": "", "partial": 0}
-        spawn(_clean_compute(period))
-    elif st["status"] != "loading" and now - st["ts"] > (60 if st["status"] == "error" else CLEAN_TTL):
-        spawn(_clean_compute(period))
-        st["status"] = "loading"
-    return JSONResponse({"ok": True, "period": period, **{k: st.get(k) for k in
-                         ("status", "rows", "progress", "total", "incomplete", "failed", "scope_all", "error", "partial")}})
-
-
 class PasswordMiddleware(BaseHTTPMiddleware):
     """Password for the dashboard (browser login window). Off if DASHBOARD_PASSWORD is not set."""
     async def dispatch(self, request, call_next):
@@ -2119,7 +1698,6 @@ app = Starlette(
         Route("/api/status", api_status),
         Route("/api/trades", api_trades),
         Route("/api/top", api_top),
-        Route("/api/clean", api_clean),
         Route("/api/paper", api_paper),
         Route("/api/paper/config", api_paper_config, methods=["POST"]),
         Route("/api/paper/reset", api_paper_reset, methods=["POST"]),
