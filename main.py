@@ -30,11 +30,11 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLU
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.78"))
 WINDOW_SECONDS = 300
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
-CONFIRM_AT = 125          # entry only after ~2 min
+CONFIRM_AT = int(os.getenv("CONFIRM_AT", "125"))          # entry only after ~2 min
 PRICE_HISTORY_LEN = 60
-MIN_LEAD_BPS = 10.0        # stronger lead filter (was 8)
-MIN_MOM_SHORT = 4.0        # short momentum confirmation
-MIN_MOM_MED = 2.5          # medium momentum confirmation
+MIN_LEAD_BPS = float(os.getenv("MIN_LEAD_BPS", "10.0"))        # lead filter (was 8 in older versions)
+MIN_MOM_SHORT = float(os.getenv("MIN_MOM_SHORT", "4.0"))        # short momentum confirmation
+MIN_MOM_MED = float(os.getenv("MIN_MOM_MED", "2.5"))          # medium momentum confirmation
 
 # Chainlink symbol map for RTDS
 CHAINLINK_SYM = {
@@ -582,6 +582,7 @@ CL_FRESH_SEC = 15.0           # Chainlink tick older than this = stale -> coin i
 RTDS_DEAD_SEC = 15.0          # no Chainlink price at all for this long -> reconnect
 RTDS_SYMBOL_DEAD_SEC = 30.0   # a coin that was updating and then went silent this long -> reconnect
 live_chainlink_ts: Dict[str, float] = {}   # symbol -> time.monotonic() of the last tick
+diag: dict = {"rtds_reconnects": 0, "last_reconnect": "", "last_reconnect_at": None}
 
 
 async def rtds_session():
@@ -655,6 +656,9 @@ async def rtds_loop():
             raise
         except Exception as e:
             logger.warning(f"RTDS reconnect in 2s: {e!r}")
+            diag["rtds_reconnects"] += 1
+            diag["last_reconnect"] = repr(e)[:150]
+            diag["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
         await asyncio.sleep(2)
 
 
@@ -860,6 +864,7 @@ async def api_status(request):
             "live_side": live.get("side"),
             "live_confidence": live.get("confidence", 0),
             "live_score": live.get("score", 0),
+            "live_reason": live.get("reason"),
             "early": ws.early,
             "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series)),
             "source": ws.source,
@@ -903,6 +908,10 @@ async def api_status(request):
 async def health(request):
     now = time.monotonic()
     return JSONResponse({"ok": True, "chainlink": list(live_chainlink.keys()),
+                         "paused": [s.replace("USDT", "") for s, w in state.items() if w.last_error],
+                         "rtds": diag,
+                         "thresholds": {"min_lead_bps": MIN_LEAD_BPS, "min_mom_short": MIN_MOM_SHORT,
+                                        "min_mom_med": MIN_MOM_MED, "confirm_at": CONFIRM_AT, "min_confidence": MIN_CONFIDENCE},
                          "tick_age_sec": {k.replace("USDT", ""): round(now - v, 1) for k, v in live_chainlink_ts.items()}})
 
 
@@ -1034,7 +1043,12 @@ h1{font-size:1.15rem;font-weight:700}
     <div class="panel"><div class="pt"><span>Віртуальні угоди</span></div><div id="plist"></div></div>
   </div>
 </div>
-<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button></nav>
+<div class="sheet" id="vchart">
+  <div class="ctabs" id="ktabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
+  <div id="tvbox" style="flex:1;min-height:0;margin-bottom:8px;border-radius:12px;overflow:hidden;background:#0b0b0c"></div>
+  <div style="font-size:.68rem;color:var(--muted);margin-bottom:8px">TradingView · Binance, 5 хв. Це не Chainlink: ціна може відрізнятись на кілька bps від тієї, за якою рахується Polymarket.</div>
+</div>
+<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
 <script>
 const S=["BTC","ETH","SOL","XRP"];
 function f(n,d=2){return n==null?"—":Number(n).toFixed(d)}
@@ -1122,6 +1136,9 @@ function render(d){
       sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_side){
       sh=`<span class="bs bw">${m.live_side} ~${(m.live_confidence*100).toFixed(0)}%${m.model_p_up!=null?` · P${Math.round((m.live_side==="UP"?m.model_p_up:1-m.model_p_up)*100)}`:""}</span>`;
+    }else if(d.seconds_passed>=d.confirm_at&&m.live_reason){
+      const rs=m.live_reason,rt=rs==="too_small_lead"?"малий відрив":rs.startsWith("jury_")?"журі "+rs.slice(5):rs;
+      sh=`<span class="bs bw" title="чому немає сигналу">${rt}</span>`;
     }else if(m.early&&m.early.side){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
@@ -1287,24 +1304,46 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     const d=await postP('/api/paper/reset',{deposit:parseFloat(document.getElementById('pdep').value)});
     fillCfg(d.config);drawAcc(d);
   };
+  let csym='BTC',cbuilt='';
+  const TVS={BTC:'BINANCE:BTCUSDT',ETH:'BINANCE:ETHUSDT',SOL:'BINANCE:SOLUSDT',XRP:'BINANCE:XRPUSDT'};
+  function loadChart(){
+    document.querySelectorAll('#ktabs button').forEach(x=>{x.className=x.dataset.s===csym?'on':''});
+    if(cbuilt===csym)return;
+    cbuilt=csym;
+    const box=document.getElementById('tvbox');
+    box.innerHTML='<div class="tradingview-widget-container" style="height:100%;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div></div>';
+    const s=document.createElement('script');
+    s.src='https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+    s.async=true;
+    let tz='Etc/UTC';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||tz}catch(e){}
+    s.text=JSON.stringify({autosize:true,symbol:TVS[csym],interval:'5',timezone:tz,theme:'dark',style:'1',locale:'uk',
+      backgroundColor:'#0b0b0c',gridColor:'rgba(255,255,255,0.06)',hide_side_toolbar:true,allow_symbol_change:false,
+      save_image:false,calendar:false,details:false,hotlist:false,withdateranges:false,support_host:'https://www.tradingview.com'});
+    box.firstChild.appendChild(s);
+  }
   function show(v){
     document.getElementById('sheet').classList.toggle('open',v==='wal');
     document.getElementById('vtop').classList.toggle('open',v==='top');
     document.getElementById('vpap').classList.toggle('open',v==='pap');
+    document.getElementById('vchart').classList.toggle('open',v==='chart');
     document.getElementById('nv1').className=v==='main'?'on':'';
     document.getElementById('nv2').className=v==='wal'?'on':'';
     document.getElementById('nv3').className=v==='top'?'on':'';
     document.getElementById('nv4').className=v==='pap'?'on':'';
+    document.getElementById('nv5').className=v==='chart'?'on':'';
     clearInterval(timer);clearTimeout(ttimer);
     if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
     else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
     else if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
+    else if(v==='chart'){loadChart()}
     else window.scrollTo(0,0);
   }
   document.getElementById('nv1').onclick=()=>show('main');
   document.getElementById('nv2').onclick=()=>show('wal');
   document.getElementById('nv3').onclick=()=>show('top');
   document.getElementById('nv4').onclick=()=>show('pap');
+  document.getElementById('nv5').onclick=()=>show('chart');
+  document.getElementById('ktabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){csym=s;loadChart()}};
   document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
   document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
   document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
