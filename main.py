@@ -9,6 +9,7 @@ If the Chainlink feed goes stale the coin is paused and the websocket is reconne
 import os
 import time
 import math
+import bisect
 import json
 import base64
 import secrets
@@ -576,6 +577,46 @@ async def paper_settle_orphans(client: httpx.AsyncClient, symbol: str, start_uni
 paper_load()
 
 
+# ====================== Reversal reserve (facts from real ticks) ======================
+TICK_HIST_MAXLEN = 3000      # ~75 min at 1.5s ticks
+tick_hist: Dict[str, deque] = {s: deque(maxlen=TICK_HIST_MAXLEN) for s in SYMBOLS}   # (unix_time, chainlink_price)
+
+
+def reversal_stats(symbol: str, lead_bps: float, horizon_sec: float) -> Optional[dict]:
+    """
+    How often did the REAL Chainlink price (as recorded by this bot) move against the current leader
+    by at least |lead| bps within `horizon_sec` seconds? Pure counting over recorded ticks, no model.
+    """
+    if horizon_sec <= 0:
+        return None
+    h = list(tick_hist[symbol])
+    n = len(h)
+    if n < 50:
+        return {"samples": 0, "hits": 0, "span_min": 0}
+    times = [t for t, _ in h]
+    span = times[-1] - times[0]
+    cushion = abs(lead_bps)
+    leader = "UP" if lead_bps >= 0 else "DOWN"
+    samples = hits = 0
+    j = 0
+    for i in range(n):
+        target = times[i] + horizon_sec
+        if target > times[-1]:
+            break
+        j = bisect.bisect_left(times, target, max(j, i))
+        if j >= n:
+            break
+        if times[j] - target > 3.0:      # data gap (reconnect / pause) -> do not count this interval
+            continue
+        d = (h[j][1] - h[i][1]) / h[i][1] * 10000
+        samples += 1
+        if (leader == "UP" and d <= -cushion) or (leader == "DOWN" and d >= cushion):
+            hits += 1
+    if span < horizon_sec + 120:
+        samples = 0
+    return {"samples": samples, "hits": hits, "span_min": int(span // 60)}
+
+
 # ====================== RTDS Chainlink ======================
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 CL_FRESH_SEC = 15.0           # Chainlink tick older than this = stale -> coin is paused (no signals)
@@ -739,6 +780,7 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     # update live
     ws.prices.append(price)
     ws.last_price = price
+    tick_hist[symbol].append((time.time(), price))
 
     # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
     if ws.early is None and seconds_passed >= 3:
@@ -841,6 +883,22 @@ async def keepalive_loop():
                 logger.debug(f"keepalive: {e}")
 
 
+def _flip_info(symbol: str, ws, current: float, lead_bps: float, time_left: int) -> Optional[dict]:
+    if not ws.signal_sent or not ws.last_signal or time_left <= 0:
+        return None
+    st = reversal_stats(symbol, lead_bps, time_left)
+    if st is None:
+        return None
+    return {
+        "leader": "UP" if lead_bps >= 0 else "DOWN",
+        "signal_side": ws.last_signal.get("side"),
+        "cushion_bps": round(abs(lead_bps), 2),
+        "cushion_usd": round(abs(current - ws.price_to_beat), 6),
+        "horizon": time_left,
+        **st,
+    }
+
+
 async def api_status(request):
     window_start = get_current_window_start()
     seconds_passed = int((datetime.now(timezone.utc) - window_start).total_seconds())
@@ -868,6 +926,7 @@ async def api_status(request):
             "early": ws.early,
             "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series)),
             "source": ws.source,
+            "flip": _flip_info(symbol, ws, current, lead, time_left),
             "stale": bool(ws.last_error),
             "series": [[t, round(p, 4)] for t, p in ws.series],
             "twap60": (round(twap_last_seconds(ws.series), 4) if ws.series else None),
@@ -1046,7 +1105,7 @@ h1{font-size:1.15rem;font-weight:700}
 <div class="sheet" id="vchart">
   <div class="ctabs" id="ktabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
   <div id="tvbox" style="flex:1;min-height:0;margin-bottom:8px;border-radius:12px;overflow:hidden;background:#0b0b0c"></div>
-  <div style="font-size:.68rem;color:var(--muted);margin-bottom:8px">TradingView · Binance, 5 хв. Це не Chainlink: ціна може відрізнятись на кілька bps від тієї, за якою рахується Polymarket.</div>
+  <div style="font-size:.68rem;color:var(--muted);margin-bottom:8px">TradingView · Bitstamp, 5 хв. Це не Chainlink: ціна може відрізнятись на кілька bps від тієї, за якою рахується Polymarket.</div>
 </div>
 <nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
 <script>
@@ -1123,7 +1182,7 @@ function render(d){
     top+=`<div class="ac"><div class="an">${n} · ${m.source||""}</div><div class="ap">$${f(m.current,n==="XRP"?4:2)}</div><div class="ach ${c}">${m.lead_bps>=0?"+":""}${m.lead_bps} bps</div></div>`;
   }
   document.getElementById("top").innerHTML=top;
-  let body="";
+  let body="",anyFlip=false;
   for(const n of S){
     const m=d.markets[n];
     if(!m||m.status==="waiting"){body+=`<div class="mrow"><div>${n}</div><div>—</div><div>—</div><div class="bs bw">…</div></div>`;continue}
@@ -1143,7 +1202,22 @@ function render(d){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
     body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
+    const fl=m.flip;
+    if(fl&&!m.stale){
+      const dir=fl.leader==="UP"?"ВНИЗ":"ВГОРУ",dec=n==="XRP"?4:2;
+      let t="";
+      if(fl.signal_side&&fl.signal_side!==fl.leader)t+=`<b class="neg">Ціна вже по інший бік від open — прогноз зараз програє.</b> `;
+      if(fl.samples){
+        const none=fl.hits===0;
+        t+=`Щоб вікно закрилось ${dir}, ціні треба пройти ${fl.cushion_bps} bps ($${f(fl.cushion_usd,dec)}) за ${fl.horizon} с. За останні ${fl.span_min} хв такий хід за такий час був у <b class="${none?"pos":"neg"}">${fl.hits} з ${fl.samples}</b> інтервалів${none?" — не траплялось":""}.`;
+      }else{
+        t+=`Щоб вікно закрилось ${dir}, ціні треба пройти ${fl.cushion_bps} bps ($${f(fl.cushion_usd,dec)}) за ${fl.horizon} с. Історії тіків ще замало для підрахунку (бот працює ~${fl.span_min} хв).`;
+      }
+      body+=`<div style="font-size:.74rem;color:var(--muted);line-height:1.4;margin:-2px 0 8px;padding:0 4px">${n}: ${t}</div>`;
+      anyFlip=true;
+    }
   }
+  if(anyFlip)body+=`<div style="font-size:.68rem;color:var(--muted);margin-top:4px">Це підрахунок фактичних тіків Chainlink, які записав бот, а не прогноз: розворот можливий, поки вікно не закрилось.</div>`;
   const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
   body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз (одразу на старті вікна, низька впевненість, окрема статистика): <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}</div>`;
   document.getElementById("mkt").innerHTML=body;
@@ -1305,7 +1379,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     fillCfg(d.config);drawAcc(d);
   };
   let csym='BTC',cbuilt='';
-  const TVS={BTC:'BINANCE:BTCUSDT',ETH:'BINANCE:ETHUSDT',SOL:'BINANCE:SOLUSDT',XRP:'BINANCE:XRPUSDT'};
+  const TVS={BTC:'BITSTAMP:BTCUSD',ETH:'BITSTAMP:ETHUSD',SOL:'BITSTAMP:SOLUSD',XRP:'BITSTAMP:XRPUSD'};
   function loadChart(){
     document.querySelectorAll('#ktabs button').forEach(x=>{x.className=x.dataset.s===csym?'on':''});
     if(cbuilt===csym)return;
