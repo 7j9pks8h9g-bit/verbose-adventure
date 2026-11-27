@@ -31,7 +31,16 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLU
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.78"))
 WINDOW_SECONDS = 300
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
-CONFIRM_AT = int(os.getenv("CONFIRM_AT", "125"))          # entry only after ~2 min
+CONFIRM_AT = int(os.getenv("CONFIRM_AT", "125"))          # regular signal only after ~2 min
+# Early signals (before CONFIRM_AT): only when the move is abnormally large for this coin's recent volatility.
+# BOTH independent checks must agree: (1) counted reversals in the last hour, (2) random-walk model.
+EARLY_ON = os.getenv("EARLY_SIGNALS", "true").strip().lower() == "true"
+EARLY_FROM = int(os.getenv("EARLY_FROM", "40"))                       # seconds into the window
+EARLY_MIN_LEAD_BPS = float(os.getenv("EARLY_MIN_LEAD_BPS", "5"))
+EARLY_MAX_REVERSAL = float(os.getenv("EARLY_MAX_REVERSAL", "0.02"))   # max share of past intervals that reversed
+EARLY_MIN_MODEL_P = float(os.getenv("EARLY_MIN_MODEL_P", "0.95"))
+EARLY_MIN_SAMPLES = int(os.getenv("EARLY_MIN_SAMPLES", "300"))
+EARLY_MIN_SPAN_MIN = int(os.getenv("EARLY_MIN_SPAN_MIN", "20"))       # minutes of recorded ticks required
 PRICE_HISTORY_LEN = 60
 MIN_LEAD_BPS = float(os.getenv("MIN_LEAD_BPS", "10.0"))        # lead filter (was 8 in older versions)
 MIN_MOM_SHORT = float(os.getenv("MIN_MOM_SHORT", "4.0"))        # short momentum confirmation
@@ -66,6 +75,8 @@ class WindowState:
         self.series: deque = deque(maxlen=400)  # (seconds_in_window, price) for chart
         self.early: Optional[dict] = None       # early (low-confidence) forecast made right at window start
         self.prev_tail: list = []                # last prices of the previous window (trend before the start)
+        self.calib_done: set = set()             # calibration checkpoints already handled in this window
+        self.calib_pending: list = []            # calibration samples waiting for the window result
 
     def reset(self, price: float, start: datetime, source: str = ""):
         self.price_to_beat = price
@@ -83,6 +94,8 @@ class WindowState:
         self.last_error = None
         self.source = source
         self.open_confirmed = False
+        self.calib_done = set()
+        self.calib_pending = []
 
 
 state: Dict[str, WindowState] = {s: WindowState(s) for s in SYMBOLS}
@@ -431,7 +444,8 @@ async def _paper_get_asks(client: httpx.AsyncClient, coin: str, side: str, start
     return None, reason
 
 
-async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int, p_model: Optional[float] = None):
+async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int, p_model: Optional[float] = None,
+                     mode: str = "confirm"):
     """Open a virtual position at the real Polymarket order book (walks the asks)."""
     coin = symbol.replace("USDT", "")
     try:
@@ -524,6 +538,8 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
             paper["trades"] = sorted(keep_open + closed, key=lambda t: t["id"], reverse=True)
         paper_save()
         logger.info(f"PAPER BUY {coin} {side} {shares:.2f} sh @ {avg:.3f} cost ${cost:.2f} fee ${fee:.3f}")
+        if live_rt["armed"] and (mode != "early" or LIVE_ALLOW_EARLY):
+            spawn(live_buy(client, coin, side, start_unix, trade))
     except Exception as e:
         logger.warning(f"paper_open error: {e}")
         try:
@@ -533,6 +549,7 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
 
 
 def paper_settle(coin: str, start_unix: int, actual: str) -> bool:
+    live_settle(coin, start_unix, actual)
     for t in paper["trades"]:
         if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix:
             won = t["side"] == actual
@@ -572,9 +589,502 @@ async def paper_settle_orphans(client: httpx.AsyncClient, symbol: str, start_uni
             paper_settle(coin, t["window_start"], "UP" if c >= o else "DOWN")
         elif t["window_start"] < start_unix - 1200:
             paper_void(t)
+    for t in list(live["trades"]):
+        if t["status"] != "open" or t["symbol"] != coin or t["window_start"] >= start_unix:
+            continue
+        o = await fetch_polymarket_open(client, symbol, t["window_start"])
+        c = await fetch_polymarket_close(client, symbol, t["window_start"])
+        if o is not None and c is not None:
+            live_settle(coin, t["window_start"], "UP" if c >= o else "DOWN")
+        elif t["window_start"] < start_unix - 1200:
+            t["status"] = "unresolved"
+            live_save()
 
 
 paper_load()
+
+# ====================== LIVE trading (REAL MONEY) ======================
+# Mirrors the virtual trades (same filters: edge / price band / coins) with a FIXED small stake.
+# Safety: off by default, needs LIVE_TRADING=true in the server env AND a manual switch in the UI after every restart,
+# one attempt per coin per window (never retried), daily loss limit, max open positions, circuit breaker.
+# Uses Polymarket's official unified Python SDK (pip: polymarket-client). CLOB V1 / py-clob-client no longer work.
+LIVE_ENV = os.getenv("LIVE_TRADING", "false").strip().lower() == "true"
+LIVE_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
+LIVE_WALLET = os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(os.getenv(name, str(default)))
+    except ValueError:
+        v = default
+    return max(lo, min(hi, v))
+
+
+LIVE_MAX_STAKE_USD = _env_float("LIVE_MAX_STAKE_USD", 5.0, 1.0, 100.0)          # hard cap per trade
+LIVE_STAKE = min(_env_float("LIVE_STAKE_USD", 1.0, 1.0, 100.0), LIVE_MAX_STAKE_USD)
+LIVE_DAILY_LOSS = _env_float("LIVE_DAILY_LOSS_USD", 5.0, 1.0, 10000.0)           # stop for the day at this loss
+LIVE_MAX_OPEN = int(_env_float("LIVE_MAX_OPEN", 2, 1, 4))                        # coins are correlated: limit exposure
+LIVE_MAX_SLIPPAGE = _env_float("LIVE_MAX_SLIPPAGE", 0.03, 0.0, 0.2)              # max avg price above the paper entry
+LIVE_FILE = os.getenv("LIVE_FILE", "live_state.json")
+LIVE_ALLOW_EARLY = os.getenv("LIVE_ALLOW_EARLY", "false").strip().lower() == "true"   # real money on EARLY signals: opt-in
+
+live: dict = {"trades": [], "next_id": 1, "day": "", "day_pnl": 0.0}
+live_rt: dict = {"armed": False, "disarm_reason": "", "consec_fail": 0, "last_error": None}   # never persisted
+_live_attempted: dict = {}          # (coin, window_start) -> True ; at most ONE order attempt per coin/window
+_live_client = None
+_live_client_lock: Optional[asyncio.Lock] = None
+
+
+def _mask(x) -> str:
+    s = str(x)
+    return s.replace(LIVE_PRIVATE_KEY, "***") if LIVE_PRIVATE_KEY else s
+
+
+def live_save():
+    try:
+        tmp = LIVE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(live, f)
+        os.replace(tmp, LIVE_FILE)
+    except Exception as e:
+        logger.warning(f"live save failed: {e}")
+
+
+def live_load():
+    try:
+        with open(LIVE_FILE) as f:
+            data = json.load(f)
+        for k in ("trades", "next_id", "day", "day_pnl"):
+            if k in data:
+                live[k] = data[k]
+        # anything still "open" after a restart will be settled by the orphan settler
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"live load failed: {e}")
+
+
+live_load()
+
+
+def _live_roll_day():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if live.get("day") != today:
+        live["day"] = today
+        live["day_pnl"] = 0.0
+
+
+def live_disarm(reason: str):
+    if live_rt["armed"]:
+        logger.warning(f"LIVE DISARMED: {reason}")
+    live_rt["armed"] = False
+    live_rt["disarm_reason"] = reason
+
+
+def live_missing() -> list:
+    import importlib.util
+    m = []
+    if not LIVE_ENV:
+        m.append("LIVE_TRADING=true")
+    if not LIVE_PRIVATE_KEY:
+        m.append("POLYMARKET_PRIVATE_KEY")
+    if not (LIVE_WALLET.startswith("0x") and len(LIVE_WALLET) == 42):
+        m.append("POLYMARKET_WALLET_ADDRESS")
+    if not DASHBOARD_PASSWORD:
+        m.append("DASHBOARD_PASSWORD")
+    if importlib.util.find_spec("polymarket") is None:
+        m.append("SDK polymarket-client (не встановлено)")
+    return m
+
+
+async def live_client():
+    """Authenticated SDK client (created once). Raises if the key / wallet / SDK are not usable."""
+    global _live_client, _live_client_lock
+    if _live_client is not None:
+        return _live_client
+    if _live_client_lock is None:
+        _live_client_lock = asyncio.Lock()
+    async with _live_client_lock:
+        if _live_client is None:
+            from polymarket import AsyncSecureClient
+            _live_client = await asyncio.wait_for(
+                AsyncSecureClient.create(private_key=LIVE_PRIVATE_KEY, wallet=LIVE_WALLET), timeout=30)
+    return _live_client
+
+
+def _live_open_count() -> int:
+    return sum(1 for t in live["trades"] if t["status"] == "open")
+
+
+def _live_record(coin: str, side: str, start_unix: int, status: str, stake: float = 0.0, **extra) -> dict:
+    t = {
+        "id": live["next_id"], "ts": int(time.time()), "symbol": coin, "side": side, "window_start": start_unix,
+        "status": status, "stake": round(stake, 2), "pnl": 0.0, "settled_at": None,
+    }
+    t.update(extra)
+    live["next_id"] += 1
+    live["trades"].insert(0, t)
+    del live["trades"][300:]
+    live_save()
+    return t
+
+
+def _live_skip(coin: str, side: str, start_unix: int, reason: str):
+    logger.info(f"live: skipped {coin} {side}: {reason}")
+    _live_record(coin, side, start_unix, "skip", reason=reason)
+
+
+def _pick_outcome(market, side: str):
+    outs = getattr(market, "outcomes", None)
+    names = ("up", "yes") if side == "UP" else ("down", "no")
+    for n in names:
+        o = getattr(outs, n, None)
+        if o is not None:
+            return o
+    try:
+        for o in outs:
+            lab = str(getattr(o, "label", getattr(o, "name", ""))).lower()
+            if lab in names:
+                return o
+    except TypeError:
+        pass
+    return None
+
+
+async def _live_token(client: httpx.AsyncClient, sdk, coin: str, side: str, start_unix: int):
+    """Trading token for the side. Gamma gives the Up/Down -> token mapping (same as virtual trading);
+    the SDK is used as a cross-check. Returns (token, reason_if_refused)."""
+    slug = f"{coin.lower()}-updown-5m-{start_unix}"
+    meta = await paper_market_meta(client, slug)
+    if not meta or not meta[0]:
+        return None, "ринок не знайдено"
+    want = "up" if side == "UP" else "down"
+    token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
+    if not token:
+        return None, "не знайдено токен ринку"
+    try:
+        market = await asyncio.wait_for(sdk.get_market(slug=slug), timeout=8)
+        if str(getattr(market, "version", "")).lower() == "v2":
+            return None, "ринок Polymarket Protocol V2: бот поки не вміє торгувати такі ринки"
+        o = _pick_outcome(market, side)
+        st = str(getattr(o, "token_id", "") or "") if o is not None else ""
+        if st and st != str(token):
+            return None, "токен ринку не збігається з SDK (захист від ставки не в той бік)"
+    except Exception as e:
+        logger.warning(f"live: SDK market cross-check unavailable for {slug}: {_mask(e)[:120]}")
+    return str(token), None
+
+
+async def live_buy(client: httpx.AsyncClient, coin: str, side: str, start_unix: int, ptrade: Optional[dict]):
+    """Place ONE real market buy for the same side as the virtual trade. Never retried."""
+    try:
+        if not (LIVE_ENV and live_rt["armed"]):
+            return
+        key = (coin, start_unix)
+        if key in _live_attempted:
+            return
+        _live_attempted[key] = True
+        while len(_live_attempted) > 500:
+            _live_attempted.pop(next(iter(_live_attempted)))
+
+        _live_roll_day()
+        if live["day_pnl"] <= -LIVE_DAILY_LOSS:
+            live_disarm(f"денний ліміт збитку ${LIVE_DAILY_LOSS:g} досягнуто")
+            return
+        if _live_open_count() >= LIVE_MAX_OPEN:
+            _live_skip(coin, side, start_unix, f"вже відкрито {LIVE_MAX_OPEN} реальних позицій (ліміт)")
+            return
+        if time.time() > start_unix + WINDOW_SECONDS - 10:
+            _live_skip(coin, side, start_unix, "замало часу до кінця вікна")
+            return
+
+        asks, reason = await _paper_get_asks(client, coin, side, start_unix)
+        if not asks:
+            _live_skip(coin, side, start_unix, reason or "немає даних книги")
+            return
+        remaining, shares, cost = LIVE_STAKE, 0.0, 0.0
+        for p, sz in asks:
+            take = min(sz, remaining / p)
+            shares += take
+            cost += take * p
+            remaining -= take * p
+            if remaining < 0.01:
+                break
+        if shares <= 0 or cost < LIVE_STAKE * 0.98:
+            _live_skip(coin, side, start_unix, "замало ліквідності на повну ставку")
+            return
+        avg = cost / shares
+        limit = min(paper.get("max_price", 99) / 100.0, ((ptrade or {}).get("entry") or avg) + LIVE_MAX_SLIPPAGE, 0.97)
+        if avg > limit + 1e-9:
+            _live_skip(coin, side, start_unix, f"ціна {avg*100:.0f}¢ вища за ліміт {limit*100:.0f}¢")
+            return
+
+        sdk = await live_client()
+        token, why = await _live_token(client, sdk, coin, side, start_unix)
+        if not token:
+            _live_skip(coin, side, start_unix, why or "токен недоступний")
+            return
+        if not live_rt["armed"]:
+            return          # switched off while we were checking
+
+        est_fee = shares * PAPER_FEE_RATE * (avg * (1 - avg)) ** 2
+        try:
+            resp = await asyncio.wait_for(
+                sdk.place_market_order(asset_id=token, side="BUY", amount=f"{LIVE_STAKE:.2f}"), timeout=20)
+        except asyncio.TimeoutError:
+            _live_record(coin, side, start_unix, "unknown", LIVE_STAKE, est_entry=round(avg, 4),
+                         msg="таймаут: невідомо, чи виконано. Перевір акаунт Polymarket")
+            live_disarm("таймаут ордера: стан невідомий, перевір акаунт Polymarket")
+            return
+        except Exception as e:
+            live_rt["consec_fail"] += 1
+            msg = _mask(e)[:200]
+            live_rt["last_error"] = msg
+            _live_record(coin, side, start_unix, "failed", LIVE_STAKE, msg=msg)
+            logger.warning(f"live order error {coin} {side}: {msg}")
+            if live_rt["consec_fail"] >= 3:
+                live_disarm("3 помилки ордерів поспіль")
+            return
+
+        if not bool(getattr(resp, "ok", False)):
+            live_rt["consec_fail"] += 1
+            msg = _mask(getattr(resp, "message", "") or "ордер відхилено")[:200]
+            live_rt["last_error"] = msg
+            _live_record(coin, side, start_unix, "failed", LIVE_STAKE, msg=msg)
+            logger.warning(f"live order rejected {coin} {side}: {msg}")
+            if live_rt["consec_fail"] >= 3:
+                live_disarm("3 відхилені ордери поспіль")
+            return
+
+        live_rt["consec_fail"] = 0
+        live_rt["last_error"] = None
+        _live_record(coin, side, start_unix, "open", LIVE_STAKE, est_entry=round(avg, 4),
+                     est_shares=round(shares, 4), est_fee=round(est_fee, 4),
+                     order_id=str(getattr(resp, "order_id", "") or ""))
+        logger.info(f"LIVE BUY {coin} {side} ${LIVE_STAKE:.2f} @~{avg:.3f} order={getattr(resp, 'order_id', '')}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"live_buy crashed: {_mask(e)[:200]}")
+        live_rt["last_error"] = _mask(e)[:200]
+
+
+def live_settle(coin: str, start_unix: int, actual: str) -> bool:
+    """Book the result of a real position (ESTIMATE from the book price; the exact numbers are in your Polymarket account)."""
+    for t in live["trades"]:
+        if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix:
+            fee = t.get("est_fee", 0.0)
+            if t["side"] == actual:
+                t["pnl"] = round(t["est_shares"] - t["stake"] - fee, 2)
+                t["status"] = "win"
+            else:
+                t["pnl"] = round(-(t["stake"] + fee), 2)
+                t["status"] = "loss"
+            t["settled_at"] = int(time.time())
+            _live_roll_day()
+            live["day_pnl"] = round(live["day_pnl"] + t["pnl"], 2)
+            if live_rt["armed"] and live["day_pnl"] <= -LIVE_DAILY_LOSS:
+                live_disarm(f"денний ліміт збитку ${LIVE_DAILY_LOSS:g} досягнуто")
+            live_save()
+            logger.info(f"LIVE {t['status'].upper()} {coin} {t['side']} est.pnl ${t['pnl']:.2f}")
+            return True
+    return False
+
+
+def _live_payload() -> dict:
+    _live_roll_day()
+    w = LIVE_WALLET
+    return {
+        "missing": live_missing(),
+        "armed": live_rt["armed"],
+        "disarm_reason": live_rt["disarm_reason"],
+        "last_error": live_rt["last_error"],
+        "wallet_short": (w[:6] + "…" + w[-4:]) if len(w) > 12 else "",
+        "stake": LIVE_STAKE,
+        "daily_loss_limit": LIVE_DAILY_LOSS,
+        "day_pnl": round(live["day_pnl"], 2),
+        "open": _live_open_count(),
+        "max_open": LIVE_MAX_OPEN,
+        "paper_enabled": paper["enabled"],
+        "allow_early": LIVE_ALLOW_EARLY,
+        "trades": live["trades"][:30],
+    }
+
+
+async def api_live(request):
+    return JSONResponse(_live_payload())
+
+
+async def api_live_arm(request):
+    # custom header: a foreign website cannot set it (CSRF protection for a real-money switch)
+    if request.headers.get("x-requested-with") != "signals":
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    if not b.get("armed"):
+        live_disarm("вимкнено вручну")
+        return JSONResponse(_live_payload())
+    miss = live_missing()
+    if miss:
+        live_rt["last_error"] = "Не готово: " + ", ".join(miss)
+        return JSONResponse(_live_payload())
+    if not paper["enabled"]:
+        live_rt["last_error"] = "Спочатку увімкни «Торгувати віртуально»: live повторює її угоди та фільтри"
+        return JSONResponse(_live_payload())
+    try:
+        await live_client()          # preflight: authenticates key + wallet, places NO order
+    except Exception as e:
+        live_rt["last_error"] = "Не вдалося підключитись: " + _mask(e)[:200]
+        return JSONResponse(_live_payload())
+    live_rt.update(armed=True, disarm_reason="", consec_fail=0, last_error=None)
+    logger.warning("LIVE ARMED by user")
+    return JSONResponse(_live_payload())
+
+
+
+# ====================== Calibration: where is the REAL edge? (facts only) ======================
+# At fixed seconds of every window the bot records: the current leader (side with price above/below open), the lead in bps,
+# the real Polymarket best ask for that side, and later the real result. The table then shows, per moment in the window,
+# how often the leader really won, what the market charged for it, and the average real result per share after fees.
+CALIB_CPS = (30, 60, 90, 120, 150, 180, 240)
+CALIB_THRS = (0.0, 3.0, 6.0, 10.0)               # min |lead| in bps for the table filters
+CALIB_FILE = os.getenv("CALIB_FILE", "calib.json")
+calib: deque = deque(maxlen=30000)               # [coin, cp, lead_bps, up(1/0), win(1/0), ask|None, mom_bps, unix_ts]
+_calib_saved_at = 0.0
+
+
+def calib_load():
+    try:
+        with open(CALIB_FILE) as f:
+            for row in json.load(f):
+                if isinstance(row, list) and len(row) == 8:
+                    calib.append(row)
+        logger.info(f"calibration loaded: {len(calib)} samples")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"calib load failed: {e}")
+
+
+def calib_save(force: bool = False):
+    global _calib_saved_at
+    if not force and time.time() - _calib_saved_at < 120:
+        return
+    _calib_saved_at = time.time()
+    try:
+        tmp = CALIB_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(list(calib), f, separators=(",", ":"))
+        os.replace(tmp, CALIB_FILE)
+    except Exception as e:
+        logger.warning(f"calib save failed: {e}")
+
+
+calib_load()
+
+
+async def calib_fill_ask(client: httpx.AsyncClient, symbol: str, start_unix: int, sample: dict):
+    """Best ask (what the market charges) for the leader side at the checkpoint. Best effort, single request."""
+    try:
+        coin = symbol.replace("USDT", "")
+        meta = await paper_market_meta(client, f"{coin.lower()}-updown-5m-{start_unix}")
+        if not meta:
+            return
+        want = "up" if sample["side"] == "UP" else "down"
+        token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
+        if not token:
+            return
+        r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=4.0)
+        prices = []
+        for x in (r.json().get("asks") or []):
+            try:
+                p = float(x["price"])
+            except Exception:
+                continue
+            if 0 < p < 1:
+                prices.append(p)
+        if prices:
+            sample["ask"] = min(prices)
+    except Exception as e:
+        logger.debug(f"calib ask {symbol}: {e}")
+
+
+def _own_final_price(symbol: str, start_unix: int) -> Optional[float]:
+    """Last recorded Chainlink tick at the end of the window (the same feed Polymarket settles on).
+    Used only when Polymarket does not return the exact close price; None if our ticks do not reach the window end."""
+    end = start_unix + WINDOW_SECONDS
+    for t, p in reversed(tick_hist.get(symbol, ())):
+        if t <= end:
+            return p if end - t <= 8 else None
+    return None
+
+
+async def calib_settle(client: httpx.AsyncClient, symbol: str, start_unix: int, pending: list, open_px: Optional[float]):
+    """Attach the real result to the samples of a finished window.
+    1) the exact close price from Polymarket (it can appear a while after the window ends, so be patient: ~3 min);
+    2) otherwise our own last Chainlink tick of the window; 3) otherwise the samples are dropped (and counted)."""
+    try:
+        final, src_name = None, ""
+        for i in range(14):
+            final = await fetch_polymarket_close(client, symbol, start_unix)
+            if final is not None:
+                src_name = "exact"
+                break
+            await asyncio.sleep(4 if i < 2 else 15)
+        if final is None:
+            final = _own_final_price(symbol, start_unix)
+            src_name = "own_ticks"
+        if final is None or not open_px:
+            diag["calib"]["dropped"] += len(pending)
+            logger.info(f"calib {symbol}: no result for window {start_unix}, {len(pending)} samples dropped")
+            return
+        outcome = "UP" if final >= open_px else "DOWN"
+        for s in pending:
+            calib.append([s["coin"], s["cp"], s["lead"], 1 if s["side"] == "UP" else 0,
+                          1 if s["side"] == outcome else 0, s.get("ask"), s["mom"], s["ts"]])
+        diag["calib"][src_name] += len(pending)
+        calib_save()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"calib settle {symbol}: {e}")
+
+
+def calib_stats() -> dict:
+    acc = {thr: {cp: [0, 0, 0, 0.0, 0.0] for cp in CALIB_CPS} for thr in CALIB_THRS}   # n, wins, n_ask, sum_ask, sum_pnl
+    for coin, cp, lead, up, win, ask, mom, ts in calib:
+        if cp not in acc[0.0]:
+            continue
+        for thr in CALIB_THRS:
+            if abs(lead) >= thr:
+                a = acc[thr][cp]
+                a[0] += 1
+                a[1] += win
+                if ask is not None and 0 < ask < 1:
+                    a[2] += 1
+                    a[3] += ask
+                    a[4] += (1.0 if win else 0.0) - ask - fee_per_share(ask)
+    out = {}
+    for thr in CALIB_THRS:
+        rows = []
+        for cp in CALIB_CPS:
+            n, w, na, sa, sp = acc[thr][cp]
+            rows.append({
+                "cp": cp, "n": n,
+                "wr": round(w / n * 100, 1) if n else None,
+                "ask": round(sa / na * 100, 1) if na else None,
+                "pnl": round(sp / na * 100, 2) if na else None,
+                "n_ask": na,
+            })
+        out[str(int(thr))] = rows
+    return out
+
+
+async def api_calib(request):
+    return JSONResponse({"total": len(calib), "thresholds": [int(t) for t in CALIB_THRS], "rows": calib_stats()})
 
 
 # ====================== Reversal reserve (facts from real ticks) ======================
@@ -617,13 +1127,62 @@ def reversal_stats(symbol: str, lead_bps: float, horizon_sec: float) -> Optional
     return {"samples": samples, "hits": hits, "span_min": int(span // 60)}
 
 
+def early_signal(symbol: str, ws, price: float, seconds_passed: int) -> Optional[dict]:
+    """Signal BEFORE the regular confirmation time. Returns None unless the evidence is strong:
+    a big lead, momentum not reversing, >= 20 min of recorded ticks, (almost) no reversals of this size in that
+    history for the time left, AND the random-walk model agrees."""
+    if not ws.price_to_beat or ws.price_to_beat <= 0:
+        return None
+    lead = (price - ws.price_to_beat) / ws.price_to_beat * 10000
+    if abs(lead) < EARLY_MIN_LEAD_BPS:
+        return None
+    side = "UP" if lead > 0 else "DOWN"
+    mom = momentum_bps(ws.prices, lookback=12)
+    if (side == "UP" and mom < 0) or (side == "DOWN" and mom > 0):
+        return None                                   # price is already moving back toward open
+    time_left = WINDOW_SECONDS - seconds_passed
+    st = reversal_stats(symbol, lead, time_left)
+    if not st or st["samples"] < EARLY_MIN_SAMPLES or st["span_min"] < EARLY_MIN_SPAN_MIN:
+        return None
+    rate = st["hits"] / st["samples"]
+    if rate > EARLY_MAX_REVERSAL:
+        return None
+    p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+    if p_up is None:
+        return None
+    p_side = p_up if side == "UP" else 1.0 - p_up
+    if p_side < EARLY_MIN_MODEL_P:
+        return None
+    return {
+        "side": side,
+        "confidence": round(min(1.0 - rate, p_side), 3),   # the weaker of the two independent estimates
+        "lead_bps": round(lead, 2),
+        "time_left": time_left,
+        "score": 0,
+        "mom_short": round(mom, 2),
+        "mom_med": round(momentum_bps(ws.prices, lookback=25), 2),
+        "reason": "early",
+        "rev_hits": st["hits"], "rev_samples": st["samples"], "rev_span_min": st["span_min"],
+    }
+
+
+async def _attach_mkt_price(client: httpx.AsyncClient, entry: dict, coin: str, side: str, start_unix: int):
+    """Remember what the crowd was paying (best ask) when the signal fired."""
+    try:
+        asks, _ = await _paper_get_asks(client, coin, side, start_unix)
+        entry["mkt_price"] = round(asks[0][0], 3) if asks else None
+    except Exception as e:
+        logger.debug(f"mkt price: {e}")
+
+
 # ====================== RTDS Chainlink ======================
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 CL_FRESH_SEC = 15.0           # Chainlink tick older than this = stale -> coin is paused (no signals)
 RTDS_DEAD_SEC = 15.0          # no Chainlink price at all for this long -> reconnect
 RTDS_SYMBOL_DEAD_SEC = 30.0   # a coin that was updating and then went silent this long -> reconnect
 live_chainlink_ts: Dict[str, float] = {}   # symbol -> time.monotonic() of the last tick
-diag: dict = {"rtds_reconnects": 0, "last_reconnect": "", "last_reconnect_at": None}
+diag: dict = {"rtds_reconnects": 0, "last_reconnect": "", "last_reconnect_at": None,
+              "calib": {"exact": 0, "own_ticks": 0, "dropped": 0}}
 
 
 async def rtds_session():
@@ -748,6 +1307,11 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
         except Exception as e:
             logger.warning(f"early eval error: {e}")
 
+    # calibration: samples of the finished window get their real result in the background
+    if ws.window_start is not None and ws.window_start != window_start and ws.calib_pending:
+        pending, ws.calib_pending = ws.calib_pending, []
+        spawn(calib_settle(client, symbol, int(ws.window_start.timestamp()), pending, ws.price_to_beat))
+
     # new window
     if ws.window_start is None or ws.window_start != window_start:
         await paper_settle_orphans(client, symbol, start_unix)
@@ -782,6 +1346,23 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     ws.last_price = price
     tick_hist[symbol].append((time.time(), price))
 
+    # calibration checkpoints (only with the confirmed Polymarket open, only the first tick right after the checkpoint)
+    if ws.open_confirmed and ws.price_to_beat:
+        for cp in CALIB_CPS:
+            if cp in ws.calib_done or seconds_passed < cp:
+                continue
+            ws.calib_done.add(cp)
+            if seconds_passed - cp > 5:
+                continue
+            lead_c = (price - ws.price_to_beat) / ws.price_to_beat * 10000
+            if lead_c == 0:
+                continue
+            sample = {"coin": symbol.replace("USDT", ""), "cp": cp, "lead": round(lead_c, 2),
+                      "side": "UP" if lead_c > 0 else "DOWN", "mom": round(momentum_bps(ws.prices, 12), 2),
+                      "ts": int(time.time()), "ask": None}
+            ws.calib_pending.append(sample)
+            spawn(calib_fill_ask(client, symbol, start_unix, sample))
+
     # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
     if ws.early is None and seconds_passed >= 3:
         seq = list(ws.prev_tail) + list(ws.prices)
@@ -795,14 +1376,21 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     ws.series.append((round((now_utc - ws.window_start).total_seconds(), 1), price))
     ws.last_update = now_utc
 
-    if seconds_passed < CONFIRM_AT or ws.signal_sent:
+    if ws.signal_sent:
         return True
-
-    signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
-    if is_strong_signal(signal):
+    signal, mode = None, "confirm"
+    if seconds_passed >= CONFIRM_AT:
+        signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
+        if not is_strong_signal(signal):
+            signal = None
+    elif EARLY_ON and seconds_passed >= EARLY_FROM:
+        signal, mode = early_signal(symbol, ws, price, seconds_passed), "early"
+    if signal:
         ws.signal_sent = True
         entry = {
             **signal,
+            "mode": mode,
+            "fired_at": seconds_passed,
             "symbol": symbol.replace("USDT", ""),
             "momentum_bps": signal.get("mom_short", 0),
             "price": price,
@@ -815,11 +1403,12 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
         entry["model_p"] = round(p_side, 3) if p_side is not None else None
         ws.last_signal = entry
         signal_history.insert(0, entry)
-        spawn(paper_open(client, symbol, signal["side"], start_unix, p_side))
+        spawn(paper_open(client, symbol, signal["side"], start_unix, p_side, mode))
+        spawn(_attach_mkt_price(client, entry, symbol.replace("USDT", ""), signal["side"], start_unix))
         if len(signal_history) > 50:
             signal_history.pop()
         logger.info(
-            f"SIGNAL {symbol} {signal['side']} conf={signal['confidence']} "
+            f"SIGNAL[{mode}@{seconds_passed}s] {symbol} {signal['side']} conf={signal['confidence']} "
             f"score={signal.get('score')} lead={signal.get('lead_bps')} "
             f"mom={signal.get('mom_short')}"
         )
@@ -940,8 +1529,17 @@ async def api_status(request):
     total_r = wins + losses
     win_rate = round(wins / total_r * 100, 1) if total_r else None
 
+    timing = []
+    for label, lo, hi in (("ранні (до %d с)" % CONFIRM_AT, 0, CONFIRM_AT), ("%d–200 с" % CONFIRM_AT, CONFIRM_AT, 200), ("після 200 с", 200, 10**6)):
+        grp = [h for h in resolved if lo <= h.get("fired_at", CONFIRM_AT) < hi]
+        px = [h["mkt_price"] for h in signal_history if h.get("mkt_price") is not None and lo <= h.get("fired_at", CONFIRM_AT) < hi]
+        if grp or px:
+            timing.append({"label": label, "n": len(grp), "wins": sum(1 for h in grp if h["result"] == "win"),
+                           "avg_mkt": round(sum(px) / len(px), 3) if px else None})
+
     return JSONResponse({
         "server_time": datetime.now(timezone.utc).isoformat(),
+        "timing": timing,
         "window_start": window_start.isoformat(),
         "seconds_passed": seconds_passed,
         "time_left": time_left,
@@ -970,7 +1568,9 @@ async def health(request):
                          "paused": [s.replace("USDT", "") for s, w in state.items() if w.last_error],
                          "rtds": diag,
                          "thresholds": {"min_lead_bps": MIN_LEAD_BPS, "min_mom_short": MIN_MOM_SHORT,
-                                        "min_mom_med": MIN_MOM_MED, "confirm_at": CONFIRM_AT, "min_confidence": MIN_CONFIDENCE},
+                                        "min_mom_med": MIN_MOM_MED, "confirm_at": CONFIRM_AT, "min_confidence": MIN_CONFIDENCE,
+                                        "early": {"on": EARLY_ON, "from": EARLY_FROM, "min_lead_bps": EARLY_MIN_LEAD_BPS,
+                                                  "max_reversal": EARLY_MAX_REVERSAL, "min_model_p": EARLY_MIN_MODEL_P}},
                          "tick_age_sec": {k.replace("USDT", ""): round(now - v, 1) for k, v in live_chainlink_ts.items()}})
 
 
@@ -1068,7 +1668,14 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="pt"><span>Історія</span><span id="st"></span></div>
   <div class="stats" id="stats"></div>
   <div class="hrow" style="color:var(--muted);font-size:.65rem"><div>Час</div><div>Акт</div><div>Стор</div><div>Conf</div><div>Lead</div></div>
+  <div id="timing" style="font-size:.74rem;color:var(--muted);line-height:1.5;margin:6px 0 8px"></div>
   <div id="hist"></div>
+</div>
+<div class="panel">
+  <div class="pt"><span>Де є реальна перевага</span><span id="calN"></span></div>
+  <div class="ctabs" id="calThr"><button data-t="0">всі</button><button data-t="3">≥3 bps</button><button data-t="6">≥6 bps</button><button data-t="10">≥10 bps</button></div>
+  <div id="calBody" style="font-size:.78rem"></div>
+  <div style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px">Рядок = секунда вікна. <b>WR</b> = як часто сторона, що вела на той момент, справді виграла вікно. <b>Ціна</b> = середня ціна покупки цієї сторони на Polymarket. <b>PnL</b> = середній реальний результат однієї акції після комісії (у центах). Це підрахунок записаних фактів, не прогноз. Надійно, коли в рядку ≥30 випадків.</div>
 </div>
 <div style="height:90px"></div>
 <div class="sheet" id="sheet">
@@ -1084,8 +1691,9 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
 </div>
 <div class="sheet" id="vpap">
-  <h3>Віртуальна торгівля (без реальних грошей)</h3>
+  <h3>Віртуальна торгівля та live</h3>
   <div class="scroll">
+    <div class="panel" id="lpan" style="border:1px solid #7f1d1d"></div>
     <div class="panel">
       <div class="prow" style="justify-content:space-between"><span>Торгувати віртуально</span><button class="pbtn" id="pen">ВИМК</button></div>
       <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Монети, якими торгувати:</div>
@@ -1192,7 +1800,8 @@ function render(d){
     }else if(m.signal_sent&&m.signal){
       const s=m.signal.side;
       const sc=m.signal.score?` ${m.signal.score}/3`:"";
-      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
+      const cf=m.signal.mode==="early"?"ранній":(m.signal.confidence*100).toFixed(0)+"%";
+      sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${cf}${sc}${m.signal.model_p!=null?` · P${Math.round(m.signal.model_p*100)}`:""}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_side){
       sh=`<span class="bs bw">${m.live_side} ~${(m.live_confidence*100).toFixed(0)}%${m.model_p_up!=null?` · P${Math.round((m.live_side==="UP"?m.model_p_up:1-m.model_p_up)*100)}`:""}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_reason){
@@ -1225,6 +1834,9 @@ function render(d){
   if(st.win_rate!=null){
     document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`;
   }
+  const tm=d.timing||[];
+  const tel=document.getElementById("timing");
+  if(tel)tel.innerHTML=tm.length?("<b>Коли видано сигнал</b> (останні сигнали): "+tm.map(x=>x.label+": "+(x.n?`<b>${x.wins}/${x.n}</b>`:"—")+(x.avg_mkt!=null?` · ринок ~${Math.round(x.avg_mkt*100)}¢`:"")).join(" · ")):"";
   const h=d.history||[];
   if(h.length){
     let x="";
@@ -1234,11 +1846,29 @@ function render(d){
       const rc=e.result==="win"?"pos":e.result==="loss"?"neg":"";
       const sc=e.score?` ${e.score}/3`:"";
       const mv=e.move==null?null:e.move;
-      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
+      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${e.mode==="early"?"ранній":(e.confidence*100).toFixed(0)+"%"+sc}${e.mkt_price!=null?` <span style="color:var(--muted)">${Math.round(e.mkt_price*100)}¢</span>`:""}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
     }
     document.getElementById("hist").innerHTML=x;
   }
 }
+let calThr="6";
+async function loadCal(){
+  try{
+    const d=await(await fetch("/api/calib")).json();
+    document.querySelectorAll("#calThr button").forEach(b=>{b.className=b.dataset.t===calThr?"on":""});
+    document.getElementById("calN").textContent="записано "+d.total;
+    const rows=(d.rows&&d.rows[calThr])||[];
+    let h="<div style='display:grid;grid-template-columns:.9fr .8fr .9fr .9fr 1fr;gap:4px;color:var(--muted);font-size:.68rem;margin:6px 0 2px'><div>Секунда</div><div>Випадків</div><div>WR</div><div>Ціна</div><div>PnL/акцію</div></div>";
+    for(const r of rows){
+      const few=r.n<30,col=few?"var(--muted)":"inherit";
+      const pc=r.pnl==null?"var(--muted)":(few?"var(--muted)":(r.pnl>0?"var(--up)":"var(--down)"));
+      h+="<div style='display:grid;grid-template-columns:.9fr .8fr .9fr .9fr 1fr;gap:4px;padding:3px 0;border-top:1px solid #1f1f22;color:"+col+"'><div>"+r.cp+"с</div><div>"+r.n+"</div><div>"+(r.wr==null?"—":r.wr.toFixed(0)+"%")+"</div><div>"+(r.ask==null?"—":r.ask.toFixed(0)+"¢")+"</div><div style='color:"+pc+"'>"+(r.pnl==null?"—":(r.pnl>0?"+":"")+r.pnl.toFixed(1)+"¢")+"</div></div>";
+    }
+    if(!d.total)h+="<div style='color:var(--muted);margin-top:6px'>Збираю дані: перші результати через ~5 хв, надійні висновки після доби роботи.</div>";
+    document.getElementById("calBody").innerHTML=h;
+  }catch(e){}
+}
+document.getElementById("calThr").onclick=function(e){const t=e.target.dataset&&e.target.dataset.t;if(t!==undefined&&t!==""){calThr=t;loadCal()}};
 async function refresh(){try{render(await(await fetch("/api/status")).json())}catch(e){document.getElementById("badge").textContent="offline"}}
 (function(){
   let sym='BTC',sub='feed',tper='day',timer=null,data=null;
@@ -1340,7 +1970,47 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     }
     document.getElementById('plist').innerHTML=x||"<div style='color:var(--muted);font-size:.85rem'>Ще немає угод. Бот відкриє віртуальну угоду на наступному сигналі.</div>";
   }
+  function drawL(d){
+    const el=document.getElementById('lpan');
+    let h="<div class='pt'><span>⚠️ Реальна торгівля (live)</span></div>";
+    if(d.missing&&d.missing.length){
+      h+="<div style='font-size:.78rem;color:var(--muted);line-height:1.5'>Вимкнено на сервері. Щоб підключити, додай у Render → Environment: <b>"+d.missing.map(esc).join(', ')+"</b></div>";
+    }else{
+      h+="<div class='prow' style='justify-content:space-between'><span>Реальні ставки</span><button class='pbtn"+(d.armed?" on":"")+"' id='larm'>"+(d.armed?"УВІМК":"ВИМК")+"</button></div>";
+      h+="<div style='font-size:.75rem;color:var(--muted);line-height:1.5'>Акаунт "+esc(d.wallet_short)+" · ставка $"+d.stake+" · ліміт збитку за день $"+d.daily_loss_limit+" · сьогодні "+(d.day_pnl>=0?'+':'')+"$"+d.day_pnl+" (оцінка) · відкрито "+d.open+"/"+d.max_open+"<br>Повторює віртуальні угоди (їхні фільтри теж діють)"+(d.allow_early?", у тому числі за ранніми сигналами":", крім ранніх сигналів")+". Після кожного перезапуску сервера треба вмикати знову.</div>";
+    }
+    if(d.disarm_reason&&!d.armed)h+="<div style='font-size:.78rem;color:var(--down);margin-top:6px'>Вимкнено: "+esc(d.disarm_reason)+"</div>";
+    if(d.last_error)h+="<div style='font-size:.78rem;color:var(--down);margin-top:6px'>"+esc(d.last_error)+"</div>";
+    let x='';
+    for(const t of d.trades||[]){
+      const sc=t.side==='UP'?'var(--up)':'var(--down)';
+      const tm=new Date(t.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      let st;
+      if(t.status==='open')st="<span style='color:var(--muted)'>очікує…</span>";
+      else if(t.status==='win'||t.status==='loss')st="<b style='color:"+(t.pnl>=0?'var(--up)':'var(--down)')+"'>"+(t.status==='win'?'✓ ':'✕ ')+(t.pnl>=0?'+':'')+"$"+t.pnl.toFixed(2)+"</b>";
+      else if(t.status==='failed')st="<b style='color:var(--down)'>помилка</b>";
+      else if(t.status==='unknown')st="<b style='color:var(--down)'>перевір акаунт!</b>";
+      else st="<span style='color:var(--muted)'>"+(t.status==='skip'?'пропущено':t.status)+"</span>";
+      const sub=t.reason||t.msg||(t.stake?("ставка $"+t.stake.toFixed(2)+(t.est_entry?" · ~"+Math.round(t.est_entry*100)+"¢":"")):"");
+      x+="<div class='wrow'><div style='display:flex;justify-content:space-between'><span>"+esc(t.symbol)+" <span style='color:"+sc+"'>"+t.side+"</span></span>"+st+"</div><div class='sub'>"+tm+" · "+esc(sub)+"</div></div>";
+    }
+    if(x)h+="<div style='margin-top:10px'>"+x+"</div>";
+    el.innerHTML=h;
+    const b=document.getElementById('larm');
+    if(b)b.onclick=()=>armL(!d.armed);
+  }
+  async function armL(on){
+    if(on&&!confirm('Увімкнути РЕАЛЬНІ ставки? Бот сам купуватиме на гроші з твого акаунта Polymarket. Максимальний збиток обмежений лімітом за день, але ринок може піти проти тебе.'))return;
+    try{
+      const r=await fetch('/api/live/arm',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'signals'},body:JSON.stringify({armed:on})});
+      drawL(await r.json());
+    }catch(e){}
+  }
+  async function loadL(){
+    try{drawL(await (await fetch('/api/live')).json())}catch(e){}
+  }
   async function loadP(){
+    loadL();
     try{
       const d=await (await fetch('/api/paper')).json();
       if(!pinit){fillCfg(d.config);pinit=true}
@@ -1423,6 +2093,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
 })();
 refresh();setInterval(refresh,2000);
+loadCal();setInterval(loadCal,30000);
 </script>
 </body>
 </html>"""
@@ -1814,6 +2485,9 @@ app = Starlette(
         Route("/api/paper", api_paper),
         Route("/api/paper/config", api_paper_config, methods=["POST"]),
         Route("/api/paper/reset", api_paper_reset, methods=["POST"]),
+        Route("/api/live", api_live),
+        Route("/api/calib", api_calib),
+        Route("/api/live/arm", api_live_arm, methods=["POST"]),
         Route("/health", health),
     ],
     on_startup=[on_startup],
