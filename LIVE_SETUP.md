@@ -70,4 +70,4 @@ EARLY_MIN_MODEL_P=0.95, EARLY_MIN_SAMPLES=300, EARLY_MIN_SPAN_MIN=20.
 Змінні: VOL_ON=2.0, VOL_OFF=1.4, VOL_HIGH=3.0, VOL_EXTREME=4.5, VOL_SHORT_SEC=45.
 
 ## 9. Історія
-Зберігається і показується останніх 100 сигналів (HISTORY_KEEP=100).
+Зберігається і показується останніх 150 сигналів (HISTORY_KEEP=150).

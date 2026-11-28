@@ -47,7 +47,7 @@ ENABLE_15M = os.getenv("ENABLE_15M", "true").strip().lower() == "true"
 CONFIRM_AT_15 = int(os.getenv("CONFIRM_AT_15", str(CONFIRM_AT * 3)))             # 125 s -> 375 s
 EARLY_FROM_15 = int(os.getenv("EARLY_FROM_15", str(EARLY_FROM * 3)))             # 40 s -> 120 s
 EARLY_MIN_SPAN_MIN_15 = int(os.getenv("EARLY_MIN_SPAN_MIN_15", "40"))            # minutes of recorded ticks needed
-HISTORY_KEEP = int(os.getenv("HISTORY_KEEP", "100"))                             # signals kept / shown in the history
+HISTORY_KEEP = int(os.getenv("HISTORY_KEEP", "150"))                             # signals kept / shown in the history
 CALIB_CPS = (30, 60, 90, 120, 150, 180, 240)                                     # calibration checkpoints (5m window)
 CALIB_FILE = os.getenv("CALIB_FILE", "calib.json")
 CALIB_FILE_15 = os.getenv("CALIB_FILE_15", "calib15.json")
@@ -367,8 +367,8 @@ def _paper_default(name: str = "") -> dict:
         "enabled": False,
         "deposit": 1000.0,
         "balance": 1000.0,
-        "stake_mode": "pct",      # "pct" = % of balance, "usd" = fixed $, "kelly" = fractional Kelly (% of full Kelly)
-        "stake_value": 5.0,
+        "stake_mode": "usd",      # "usd" = fixed $ (default), "pct" = % of account, "kelly" = fractional Kelly (% of full Kelly)
+        "stake_value": 10.0,
         "min_edge": 0.0,          # % ; 0 = filter off
         "min_price": 0,           # cents ; crowd-confirmation filter (0 = off)
         "max_price": 99,          # cents ; do not buy above this
@@ -542,17 +542,22 @@ def _paper_open_w(w: dict, client: httpx.AsyncClient, coin: str, side: str, star
             if edge_best * 100 < w["min_edge"]:
                 paper_skip(w, coin, side, start_unix, f"edge {edge_best*100:.1f}% < мін. {w['min_edge']:.1f}%")
                 return
+        fixed = w["stake_mode"] not in ("pct", "kelly")
+        # % and Kelly are taken from the whole account (free balance + money in open positions), so several coins in
+        # the same window get the same stake instead of each next one being smaller
+        base = bal + sum(t["cost"] + t["fee"] for t in w["trades"] if t["status"] == "open")
         if w["stake_mode"] == "kelly":
             if edge_best is None or edge_best <= 0:
                 paper_skip(w, coin, side, start_unix, "Kelly: edge ≤ 0 або немає моделі")
                 return
             f_full = (p_eff - c_best) / (1.0 - c_best)
-            stake = bal * min(f_full * w["stake_value"] / 100.0, PAPER_KELLY_CAP)
+            stake = base * min(f_full * w["stake_value"] / 100.0, PAPER_KELLY_CAP)
         elif w["stake_mode"] == "pct":
-            stake = bal * w["stake_value"] / 100.0
+            stake = base * w["stake_value"] / 100.0
         else:
             stake = w["stake_value"]
-        stake = min(stake, bal)
+        if not fixed:
+            stake = min(stake, bal)
         if stake < 1:
             paper_skip(w, coin, side, start_unix, "ставка менша за $1 (баланс або Kelly замалі)")
             return
@@ -568,9 +573,16 @@ def _paper_open_w(w: dict, client: httpx.AsyncClient, coin: str, side: str, star
         if shares <= 0 or cost < 1:
             paper_skip(w, coin, side, start_unix, "замало ліквідності")
             return
+        if fixed and cost < stake * 0.995:
+            # a fixed stake is always the full amount: never silently shrink it on a thin order book
+            paper_skip(w, coin, side, start_unix, f"замало ліквідності для повної ставки ${stake:.2f} (можна лише ${cost:.2f})")
+            return
         avg = cost / shares
         fee = shares * PAPER_FEE_RATE * (avg * (1 - avg)) ** 2
         total = cost + fee
+        if fixed and total > w["balance"] + 1e-9:
+            paper_skip(w, coin, side, start_unix, f"недостатньо балансу для ставки ${stake:.2f} + комісія (є ${w['balance']:.2f})")
+            return
         if total > w["balance"]:
             k = w["balance"] / total
             shares, cost, fee, total = shares * k, cost * k, fee * k, total * k
@@ -1875,10 +1887,6 @@ header{padding-right:52px}
 .vclose{width:100%;margin-top:14px;padding:11px;border-radius:10px;border:1px solid var(--border);background:#1c1c1f;color:var(--text);font-size:.9rem}
 .sheet h3{margin:0 0 10px;font-size:1rem}
 .sheet .scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:12px}
-.subtabs{display:flex;gap:6px;margin:10px 0 4px;overflow-x:auto}
-.subtabs button{flex:none;padding-left:14px!important;padding-right:14px!important;white-space:nowrap;background:#1c1c1f;color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:8px 0;font-size:.74rem;font-weight:600}
-.subtabs button.on{color:var(--text);border-color:var(--accent)}
-.vbar{display:flex;height:10px;border-radius:6px;overflow:hidden;margin:8px 0 4px;background:#232326}
 .wrow{padding:9px 0;border-bottom:1px solid var(--border);font-size:.82rem}
 .wrow a{color:var(--text);text-decoration:none;font-family:ui-monospace,Menlo,monospace}
 .wrow .sub{color:var(--muted);font-size:.74rem;margin-top:2px}
@@ -1911,18 +1919,6 @@ header{padding-right:52px}
   <div id="volnote" style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px"></div>
   <button id="vclose" class="vclose">Закрити</button>
 </div></div>
-<div class="sheet" id="sheet">
-  <h3>Угоди на Polymarket (поточне вікно)</h3>
-  <div class="ctabs" id="wtabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
-  <div id="wsum"></div>
-  <div class="subtabs" id="wsub"><button data-t="feed">Стрічка</button><button data-t="buy">Купівлі</button><button data-t="sell">Продажі</button><button data-t="up">Up</button><button data-t="down">Down</button><button data-t="top">Гаманці</button></div>
-  <div class="scroll" id="wbody" style="color:var(--muted);font-size:.85rem">Завантаження…</div>
-</div>
-<div class="sheet" id="vtop">
-  <h3>Найуспішніші трейдери · крипто (за прибутком)</h3>
-  <div class="ctabs" id="ttabs" style="margin-top:4px"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
-  <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
-</div>
 <div class="sheet" id="v15">
   <h3>Прогнози на 15 хв</h3>
   <div class="scroll"><!--P15-->
@@ -1938,7 +1934,7 @@ header{padding-right:52px}
       <div class="prow" style="justify-content:space-between"><span>Торгувати віртуально</span><button class="pbtn" id="pen">ВИМК</button></div>
       <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Монети, якими торгувати:</div>
       <div class="ctabs" id="pcoins"><button data-c="BTC">BTC</button><button data-c="ETH">ETH</button><button data-c="SOL">SOL</button><button data-c="XRP">XRP</button></div>
-      <div class="prow"><label>Ставка</label><select class="inp" id="pmode" style="flex:1.2"><option value="pct">% від балансу</option><option value="usd">$ фіксована</option><option value="kelly">Kelly (% від повного)</option></select><input class="inp" id="pval" type="number" inputmode="decimal" style="flex:1"></div>
+      <div class="prow"><label>Ставка</label><select class="inp" id="pmode" style="flex:1.2"><option value="usd">$ фіксована (завжди та сама)</option><option value="pct">% від рахунку</option><option value="kelly">Kelly (% від повного)</option></select><input class="inp" id="pval" type="number" inputmode="decimal" style="flex:1"></div>
       <div style="font-size:.72rem;color:var(--muted);margin:10px 0 2px">Фільтри входу (0 = вимкнено):</div>
       <div class="prow"><label>Мін. edge %</label><input class="inp" id="pedge" type="number" inputmode="decimal"></div>
       <div class="prow"><label>Ціна ¢ від</label><input class="inp" id="pminp" type="number" inputmode="numeric" style="flex:1"><label style="min-width:30px;text-align:center">до</label><input class="inp" id="pmaxp" type="number" inputmode="numeric" style="flex:1"></div>
@@ -1955,7 +1951,7 @@ header{padding-right:52px}
   <div id="tvbox" style="flex:1;min-height:0;margin-bottom:8px;border-radius:12px;overflow:hidden;background:#0b0b0c"></div>
   <div style="font-size:.68rem;color:var(--muted);margin-bottom:8px">TradingView · Bitstamp, 5 хв. Це не Chainlink: ціна може відрізнятись на кілька bps від тієї, за якою рахується Polymarket.</div>
 </div>
-<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv6">⏱️<span>15 хв</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
+<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv6">⏱️<span>15 хв</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
 <script>
 const S=["BTC","ETH","SOL","XRP"];
 function f(n,d=2){return n==null?"—":Number(n).toFixed(d)}
@@ -2169,62 +2165,8 @@ for(const sx of ["","15"]){
   E("calThr",sx).onclick=function(e){const t=e.target.dataset&&e.target.dataset.t;if(t!==undefined&&t!==""){VS[sx].thr=t;loadCal(sx)}};
 }
 (function(){
-  let sym='BTC',sub='feed',tper='day',timer=null,data=null;
+  let timer=null;
   const esc=x=>String(x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  const short=a=>a?a.slice(0,6)+'…'+a.slice(-4):'—';
-  const usd=x=>'$'+Math.abs(x).toLocaleString('en-US',{maximumFractionDigits:0});
-  const tm=ts=>ts?new Date(ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'';
-  function who(w){
-    const link='https://polymarket.com/profile/'+esc(w.wallet);
-    return "<a href='"+link+"' target='_blank' rel='noopener'>"+(w.name?esc(w.name)+' · ':'')+short(w.wallet)+"</a>";
-  }
-  function tradeRow(t){
-    const c=t.outcome==='Up'?'var(--up)':'var(--down)';
-    return "<div class='wrow'>"+who(t)+"<div class='sub'>"+(t.side==='BUY'?'купив':'продав')+" <span style='color:"+c+"'>"+esc(t.outcome)+"</span> · "+usd(t.usd)+" @ "+Math.round(t.price*100)+"¢ · "+tm(t.ts)+"</div></div>";
-  }
-  function draw(){
-    document.querySelectorAll('#wtabs button').forEach(x=>{x.className=x.dataset.s===sym?'on':''});
-    document.querySelectorAll('#wsub button').forEach(x=>{x.className=x.dataset.t===sub?'on':''});
-    const b=document.getElementById('wbody'),sm=document.getElementById('wsum');
-    if(!data){b.innerHTML='Завантаження…';return}
-    if(!data.ok){sm.innerHTML='';b.innerHTML=esc(data.error||'Помилка');return}
-    const up=data.totals.Up,dn=data.totals.Down,tot=up+dn||1;
-    sm.innerHTML="<div style='display:flex;justify-content:space-between;font-size:.85rem'><span style='color:var(--up)'>Up "+usd(up)+"</span><span style='color:var(--down)'>Down "+usd(dn)+"</span></div><div class='vbar'><div style='width:"+(up/tot*100)+"%;background:#22c55e'></div><div style='flex:1;background:#ef4444'></div></div><div style='font-size:.72rem;color:var(--muted)'>Завантажено угод: "+(data.count||0)+" (куплено, у $)</div>";
-    let x='';
-    if(sub==='top'){
-      for(const w of data.wallets){
-        x+="<div class='wrow'>"+who(w)+"<div class='sub'>Купив: <span style='color:var(--up)'>Up "+usd(w.bUp)+"</span> · <span style='color:var(--down)'>Down "+usd(w.bDown)+"</span></div><div class='sub'>Продав: <span style='color:var(--up)'>Up "+usd(w.sUp)+"</span> · <span style='color:var(--down)'>Down "+usd(w.sDown)+"</span> · угод: "+w.n+" · "+tm(w.last)+"</div></div>";
-      }
-    }else{
-      const list=data.trades.filter(t=>sub==='feed'||(sub==='buy'&&t.side==='BUY')||(sub==='sell'&&t.side==='SELL')||(sub==='up'&&t.outcome==='Up')||(sub==='down'&&t.outcome==='Down'));
-      for(const t of list)x+=tradeRow(t);
-    }
-    b.innerHTML=x||"<div style='color:var(--muted)'>Поки порожньо</div>";
-  }
-  async function load(){
-    try{
-      const r=await fetch('/api/trades?symbol='+sym);
-      data=await r.json();
-    }catch(e){data={ok:false,error:'Не вдалося завантажити'}}
-    draw();
-  }
-  let ttimer=null;
-  async function loadT(){
-    clearTimeout(ttimer);
-    document.querySelectorAll('#ttabs button').forEach(x=>{x.className=x.dataset.p===tper?'on':''});
-    const b=document.getElementById('tbody');
-    try{
-      const r=await fetch('/api/top?period='+tper);
-      const d=await r.json();
-      if(!d.ok){b.innerHTML=esc(d.error||'Помилка');return}
-      let x='';
-      for(const w of d.rows){
-        const c=w.pnl>=0?'var(--up)':'var(--down)';
-        x+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><span><span style='color:var(--muted)'>#"+w.rank+"</span> "+who(w)+"</span><b style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+usd(w.pnl)+"</b></div></div>";
-      }
-      b.innerHTML=x||'Поки порожньо';
-    }catch(e){b.innerHTML='Не вдалося завантажити'}
-  }
   let pinit=false,pen=false,pcoins={},pdepSrv=0,pw=0,ctimer=null;
   const money=x=>(x<0?'-':'')+'$'+Math.abs(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   function drawCfg(){
@@ -2339,13 +2281,13 @@ for(const sx of ["","15"]){
   };
   async function saveCfg(explicit){
     const body={enabled:pen,coins:pcoins};
+    body.stake_mode=document.getElementById('pmode').value;
+    body.stake_value=parseFloat(document.getElementById('pval').value);
+    body.min_edge=parseFloat(document.getElementById('pedge').value)||0;
+    body.min_price=parseFloat(document.getElementById('pminp').value)||0;
+    body.max_price=parseFloat(document.getElementById('pmaxp').value)||99;
     if(explicit){
       body.name=document.getElementById('pname').value;
-      body.stake_mode=document.getElementById('pmode').value;
-      body.stake_value=parseFloat(document.getElementById('pval').value);
-      body.min_edge=parseFloat(document.getElementById('pedge').value)||0;
-      body.min_price=parseFloat(document.getElementById('pminp').value)||0;
-      body.max_price=parseFloat(document.getElementById('pmaxp').value)||99;
       const dep=parseFloat(document.getElementById('pdep').value);
       if(dep>0&&Math.abs(dep-pdepSrv)>1e-9){
         if(!confirm('Депозит змінено на '+money(dep)+'. Скинути рахунок і стерти історію віртуальних угод?')){document.getElementById('pdep').value=pdepSrv;return}
@@ -2386,35 +2328,24 @@ for(const sx of ["","15"]){
     box.firstChild.appendChild(s);
   }
   function show(v){
-    document.getElementById('sheet').classList.toggle('open',v==='wal');
-    document.getElementById('vtop').classList.toggle('open',v==='top');
     document.getElementById('vpap').classList.toggle('open',v==='pap');
     document.getElementById('vchart').classList.toggle('open',v==='chart');
     document.getElementById('v15').classList.toggle('open',v==='t15');
     document.getElementById('nv6').className=v==='t15'?'on':'';
     document.getElementById('nv1').className=v==='main'?'on':'';
-    document.getElementById('nv2').className=v==='wal'?'on':'';
-    document.getElementById('nv3').className=v==='top'?'on':'';
     document.getElementById('nv4').className=v==='pap'?'on':'';
     document.getElementById('nv5').className=v==='chart'?'on':'';
-    clearInterval(timer);clearTimeout(ttimer);clearInterval(ctimer);
-    if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
-    else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
-    else if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
+    clearInterval(timer);clearInterval(ctimer);
+    if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
     else if(v==='chart'){loadChart()}
     else if(v==='t15'){refresh('15');loadCal('15');timer=setInterval(()=>refresh('15'),2000);ctimer=setInterval(()=>loadCal('15'),30000)}
     else window.scrollTo(0,0);
   }
   document.getElementById('nv1').onclick=()=>show('main');
-  document.getElementById('nv2').onclick=()=>show('wal');
-  document.getElementById('nv3').onclick=()=>show('top');
   document.getElementById('nv4').onclick=()=>show('pap');
   document.getElementById('nv5').onclick=()=>show('chart');
   document.getElementById('nv6').onclick=()=>show('t15');
   document.getElementById('ktabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){csym=s;loadChart()}};
-  document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
-  document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
-  document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
 })();
 refresh();setInterval(refresh,2000);
 loadCal();setInterval(loadCal,30000);
@@ -2468,248 +2399,6 @@ async def on_startup():
 
 
 _cid_cache: Dict[str, tuple] = {}
-_trades_cache: Dict[str, tuple] = {}
-MAX_TRADE_PAGES = 4
-
-
-async def api_trades(request):
-    """Who is trading the current 5m market on Polymarket (public data: wallets, sizes)."""
-    sym = (request.query_params.get("symbol") or "BTC").upper()
-    if sym not in ("BTC", "ETH", "SOL", "XRP"):
-        sym = "BTC"
-    now = int(datetime.now(timezone.utc).timestamp())
-    start = now - now % WINDOW_SECONDS
-    slug = f"{sym.lower()}-updown-5m-{start}"
-
-    cached = _trades_cache.get(slug)
-    if cached and now - cached[0] < 4:
-        return JSONResponse(cached[1])
-
-    def g(t, *keys, default=None):
-        for k in keys:
-            if k in t and t[k] is not None:
-                return t[k]
-        return default
-
-    def to_ts(v):
-        if v is None:
-            return 0
-        try:
-            x = int(float(v))
-        except Exception:
-            try:
-                return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
-            except Exception:
-                return 0
-        return x // 1000 if x > 10**11 else x
-
-    def as_list(v):
-        if isinstance(v, str):
-            try:
-                v = json.loads(v)
-            except Exception:
-                return []
-        return v if isinstance(v, list) else []
-
-    raw: list = []
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            meta = _cid_cache.get(slug)
-            if not meta:
-                r = await c.get("https://gamma-api.polymarket.com/events", params={"slug": slug})
-                data = r.json()
-                ev = data[0] if isinstance(data, list) and data else None
-                mk = (ev or {}).get("markets") or []
-                if mk:
-                    m0 = mk[0]
-                    tokens = as_list(m0.get("clobTokenIds"))
-                    outs = as_list(m0.get("outcomes"))
-                    tmap = {str(t): str(o) for t, o in zip(tokens, outs)}
-                    meta = (m0.get("conditionId"), tmap)
-                    if meta[0]:
-                        _cid_cache[slug] = meta
-            if not meta or not meta[0]:
-                return JSONResponse({"ok": False, "error": "Ринок ще не знайдено, спробуй за кілька секунд", "slug": slug})
-            cid, tmap = meta
-
-            # first page (try a few param variants), then follow the cursor
-            body = None
-            last_err = ""
-            for params in (
-                {"condition": cid, "limit": 500, "taker_only": "false"},
-                {"condition": cid, "limit": 200, "taker_only": "false"},
-                {"condition": cid, "taker_only": "false"},
-                {"condition": cid},
-            ):
-                r = await c.get("https://data-api.polymarket.com/v2/trades", params=params)
-                try:
-                    b = r.json()
-                except Exception:
-                    b = None
-                if r.status_code == 200 and b is not None:
-                    body = b
-                    break
-                last_err = f"{r.status_code} {str(b)[:150]}"
-                logger.warning(f"data-api v2/trades {params}: {last_err}")
-            if body is None:
-                return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}", "slug": slug})
-
-            pages = 0
-            while True:
-                rows = body.get("data") if isinstance(body, dict) else body
-                if isinstance(rows, list):
-                    raw.extend(rows)
-                pages += 1
-                pg = (body.get("pagination") or {}) if isinstance(body, dict) else {}
-                cur = pg.get("next_cursor")
-                if not cur or pages >= MAX_TRADE_PAGES or pg.get("has_more") is False:
-                    break
-                r = await c.get("https://data-api.polymarket.com/v2/trades", params={"condition": cid, "cursor": cur})
-                if r.status_code != 200:
-                    break
-                try:
-                    body = r.json()
-                except Exception:
-                    break
-    except Exception as e:
-        logger.warning(f"api_trades error: {e}")
-        if not raw:
-            return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket", "slug": slug})
-
-    trades = []
-    wallets: Dict[str, dict] = {}
-    totals = {"Up": 0.0, "Down": 0.0}
-    seen = set()
-    for t in raw:
-        if not isinstance(t, dict):
-            continue
-        try:
-            addr = g(t, "proxy_wallet", "proxyWallet", "wallet", default="")
-            side = str(g(t, "side", default="")).upper()
-            size = float(g(t, "size", default=0))
-            price = float(g(t, "price", default=0))
-            ts = to_ts(g(t, "timestamp", "created_at", "createdAt"))
-        except Exception:
-            continue
-        outcome = g(t, "outcome", default="")
-        if outcome not in ("Up", "Down"):
-            tok = str(g(t, "token_id", "asset", "assetId", "asset_id", default=""))
-            outcome = tmap.get(tok, outcome)
-        if outcome not in ("Up", "Down"):
-            idx = g(t, "outcome_index", "outcomeIndex")
-            if idx in (0, 1, "0", "1"):
-                outcome = "Up" if int(idx) == 0 else "Down"
-        txh = g(t, "transaction_hash", "transactionHash", default="")
-        key = (txh, addr, side, outcome, size, price, ts) if txh else None
-        if key is not None:
-            if key in seen:
-                continue
-            seen.add(key)
-        usd = size * price
-        name = g(t, "name", "pseudonym", default="")
-        trades.append({"wallet": addr, "name": name, "side": side, "outcome": outcome,
-                       "usd": round(usd, 2), "price": round(price, 3), "ts": ts})
-        if outcome in totals and side == "BUY":
-            totals[outcome] += usd
-        w = wallets.setdefault(addr, {"wallet": addr, "name": name, "bUp": 0.0, "bDown": 0.0,
-                                      "sUp": 0.0, "sDown": 0.0, "n": 0, "last": 0})
-        if outcome in ("Up", "Down"):
-            w[("b" if side == "BUY" else "s") + outcome] += usd
-        w["n"] += 1
-        w["last"] = max(w["last"], ts)
-
-    trades.sort(key=lambda x: x["ts"], reverse=True)
-    top = sorted(wallets.values(), key=lambda w: w["bUp"] + w["bDown"] + w["sUp"] + w["sDown"], reverse=True)[:40]
-    for w in top:
-        for k in ("bUp", "bDown", "sUp", "sDown"):
-            w[k] = round(w[k], 2)
-
-    payload = {
-        "ok": True,
-        "symbol": sym,
-        "slug": slug,
-        "window_start": start,
-        "count": len(trades),
-        "totals": {"Up": round(totals["Up"], 2), "Down": round(totals["Down"], 2)},
-        "wallets": top,
-        "trades": trades[:500],
-    }
-    _trades_cache[slug] = (now, payload)
-    if len(_trades_cache) > 40:
-        for k in sorted(_trades_cache, key=lambda k: _trades_cache[k][0])[:20]:
-            _trades_cache.pop(k, None)
-    return JSONResponse(payload)
-
-
-_top_cache: Dict[str, tuple] = {}
-
-
-async def api_top(request):
-    """Best traders by profit (Polymarket leaderboard, crypto category)."""
-    period = (request.query_params.get("period") or "day").lower()
-    if period not in ("day", "week", "month"):
-        period = "day"
-    now = int(datetime.now(timezone.utc).timestamp())
-    cached = _top_cache.get(period)
-    if cached and now - cached[0] < 60:
-        return JSONResponse(cached[1])
-
-    def g(t, *keys, default=None):
-        for k in keys:
-            if k in t and t[k] is not None:
-                return t[k]
-        return default
-
-    attempts = [
-        ("https://data-api.polymarket.com/v2/leaderboard",
-         {"time_period": period, "category": "crypto", "sort_by": "PNL", "limit": 25}),
-        ("https://data-api.polymarket.com/v1/leaderboard",
-         {"timePeriod": period.upper(), "category": "CRYPTO", "orderBy": "PNL", "limit": 25}),
-    ]
-    rows = None
-    last_err = ""
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            for url, params in attempts:
-                r = await c.get(url, params=params)
-                try:
-                    body = r.json()
-                except Exception:
-                    body = None
-                if r.status_code == 200 and body is not None:
-                    data = body.get("data") if isinstance(body, dict) else body
-                    if isinstance(data, dict):
-                        data = next((v for v in data.values() if isinstance(v, list)), [])
-                    if isinstance(data, list):
-                        rows = data
-                        break
-                last_err = f"{r.status_code} {str(body)[:150]}"
-                logger.warning(f"leaderboard {url}: {last_err}")
-    except Exception as e:
-        logger.warning(f"api_top error: {e}")
-        return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket"})
-    if rows is None:
-        return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}"})
-
-    out = []
-    for i, t in enumerate(rows):
-        if not isinstance(t, dict):
-            continue
-        try:
-            pnl = float(g(t, "pnl", "profit", default=0))
-        except Exception:
-            pnl = 0.0
-        out.append({
-            "rank": g(t, "rank", default=i + 1),
-            "wallet": g(t, "user_id", "proxy_wallet", "proxyWallet", "address", "wallet", default=""),
-            "name": g(t, "user_name", "userName", "name", "pseudonym", default=""),
-            "pnl": round(pnl, 2),
-        })
-    payload = {"ok": True, "period": period, "rows": out}
-    _top_cache[period] = (now, payload)
-    return JSONResponse(payload)
-
-
 def _wallet_idx(v) -> int:
     try:
         return max(0, min(PAPER_N - 1, int(v)))
@@ -2763,7 +2452,7 @@ async def _paper_payload(idx: int = 0):
             "winrate": round(wins / len(closed) * 100, 1) if closed else 0.0,
         },
         "curve": curve[-200:],
-        "trades": trades[:100],
+        "trades": trades[:150],
     }
 
 
@@ -2862,8 +2551,6 @@ app = Starlette(
     routes=[
         Route("/", dashboard),
         Route("/api/status", api_status),
-        Route("/api/trades", api_trades),
-        Route("/api/top", api_top),
         Route("/api/paper", api_paper),
         Route("/api/paper/config", api_paper_config, methods=["POST"]),
         Route("/api/paper/reset", api_paper_reset, methods=["POST"]),
