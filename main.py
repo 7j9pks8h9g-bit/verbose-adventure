@@ -1863,6 +1863,16 @@ h1{font-size:1.15rem;font-weight:700}
 .bnav button.on{color:var(--text)}
 .sheet{position:fixed;left:0;right:0;top:0;bottom:calc(58px + env(safe-area-inset-bottom));background:var(--bg);display:none;z-index:30;flex-direction:column;padding:14px 16px 0}
 .sheet.open{display:flex}
+header{padding-right:52px}
+.vfab{position:fixed;top:calc(10px + env(safe-area-inset-top));right:14px;z-index:55;width:40px;height:40px;border-radius:50%;background:#1c1c1f;border:1px solid var(--border);color:var(--muted);font-size:1.15rem;display:flex;align-items:center;justify-content:center;padding:0}
+.vfab .vn{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;border-radius:9px;background:var(--down);color:#fff;font-size:.65rem;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 4px}
+.vfab.l1{color:#eab308;border-color:#eab308}.vfab.l2{color:#f97316;border-color:#f97316}.vfab.l3{color:var(--down);border-color:var(--down)}
+.vfab.act{animation:vpulse 1.3s infinite}
+@keyframes vpulse{0%,100%{box-shadow:0 0 0 0 rgba(249,115,22,.55)}50%{box-shadow:0 0 0 8px rgba(249,115,22,0)}}
+.vpop{position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.6);z-index:60;display:none;align-items:flex-end}
+.vpop.open{display:flex}
+.vbox{width:100%;max-height:82vh;overflow-y:auto;background:var(--bg);border-top:1px solid var(--border);border-radius:16px 16px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom))}
+.vclose{width:100%;margin-top:14px;padding:11px;border-radius:10px;border:1px solid var(--border);background:#1c1c1f;color:var(--text);font-size:.9rem}
 .sheet h3{margin:0 0 10px;font-size:1rem}
 .sheet .scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:12px}
 .subtabs{display:flex;gap:6px;margin:10px 0 4px;overflow-x:auto}
@@ -1892,6 +1902,15 @@ h1{font-size:1.15rem;font-weight:700}
 </header>
 <!--P5-->
 <div style="height:90px"></div>
+<button id="vfab" class="vfab" aria-label="Волатильність">⚡<span id="vfn" class="vn"></span></button>
+<div id="vpop" class="vpop"><div class="vbox">
+  <div class="pt"><span>⚡ Волатильність</span><span id="volt"></span></div>
+  <div id="vol"></div>
+  <div class="sec" style="margin:12px 0 2px">Останні періоди</div>
+  <div id="volh" style="font-size:.78rem"></div>
+  <div id="volnote" style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px"></div>
+  <button id="vclose" class="vclose">Закрити</button>
+</div></div>
 <div class="sheet" id="sheet">
   <h3>Угоди на Polymarket (поточне вікно)</h3>
   <div class="ctabs" id="wtabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
@@ -2004,14 +2023,15 @@ function drawChart(d,sx){
   for(let i=0;i<=NC;i+=step){const xx=L+PW*i/NC;g+="<text x='"+(xx-(i?8:0))+"' y='"+(H-4)+"' fill='#8a8a93' font-size='9'>"+i+":00</text>"}
   box.innerHTML="<svg viewBox='0 0 "+W+" "+H+"' width='100%' style='display:block'>"+g+"</svg>";
 }
-function drawVol(d,sx){
+function drawVol(d){
   const v=d.vol;if(!v)return;
   const now=Math.floor(new Date(d.server_time).getTime()/1000);
-  let h="",nAct=0;
+  let h="",nAct=0,maxL=0,warm=0;
   for(const n of S){
     const c=v.coins[n];if(!c)continue;
     let st,sub="";
     if(c.warm){
+      warm++;
       st="<span class='bs bw'>збираю дані</span>";
       sub="потрібно ~10 хв історії тіків, щоб знати, що для цієї монети «норма»";
     }else{
@@ -2019,26 +2039,30 @@ function drawVol(d,sx){
       st="<span class='bs' style='background:rgba(255,255,255,.06);color:"+col+"'>"+(c.level?"⚡ ":"")+escH(c.label)+" ×"+f(c.ratio,1)+"</span>";
       sub="зараз "+f(c.now_bps,1)+" bps за "+v.short_sec+" с · норма "+f(c.typ_bps,1)+" · розмах "+f(c.range_bps,1);
       if(c.active&&c.since){
-        nAct++;
+        nAct++;maxL=Math.max(maxL,c.level,1);
         sub="<b style='color:"+VCOL[Math.max(1,c.level)]+"'>Триває з "+hms(c.since)+" ("+fdur(now-c.since)+"), пік ×"+f(c.peak_ratio,1)+" ("+escH(c.peak_label)+")</b><br>"+sub;
       }
     }
     h+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><b>"+n+"</b>"+st+"</div><div class='sub'>"+sub+"</div></div>";
   }
-  E("vol",sx).innerHTML=h;
-  E("volt",sx).textContent=nAct?("⚡ зараз: "+nAct):"спокійно";
+  document.getElementById("vol").innerHTML=h;
+  document.getElementById("volt").textContent=nAct?("⚡ зараз: "+nAct):(warm===S.length?"збираю дані":"спокійно");
   let eh="";
   for(const e of (v.events||[]).slice(0,10)){
     const col=VCOL[Math.max(1,e.peak_level)];
     eh+="<div class='wrow' style='padding:6px 0'><b>"+escH(e.symbol)+"</b> · "+hms(e.start)+" → "+(e.active?"<b style='color:"+col+"'>триває</b>":hms(e.end))+" ("+fdur(e.dur)+") · <span style='color:"+col+"'>пік ×"+f(e.peak_ratio,1)+"</span><div class='sub'>розмах "+f(e.range_bps,1)+" bps · рух від старту "+(e.move_bps>=0?"+":"")+f(e.move_bps,1)+" bps</div></div>";
   }
-  E("volh",sx).innerHTML=eh||"<div style='color:var(--muted)'>Поки не було</div>";
-  E("volnote",sx).innerHTML="<b>×N</b> = наскільки різкіше ціна рухається за останні "+v.short_sec+" с порівняно зі звичайним рівнем цієї монети (медіана за останню годину; ×1 = норма). Період починається, коли ≥×"+v.on+" тримається кілька секунд, і закінчується, коли &lt;×"+v.off+" тримається ~30 с. Рівні: помірна ≥×"+v.on+", висока ≥×"+v.high+", екстремальна ≥×"+v.extreme+". Під час такої волатильності ціна ринку може швидко йти до крайніх значень і розвертатись. Це лише індикація: на сигнали та угоди вона не впливає.";
+  document.getElementById("volh").innerHTML=eh||"<div style='color:var(--muted)'>Поки не було</div>";
+  document.getElementById("volnote").innerHTML="<b>×N</b> = наскільки різкіше ціна рухається за останні "+v.short_sec+" с порівняно зі звичайним рівнем цієї монети (медіана за останню годину; ×1 = норма). Період починається, коли ≥×"+v.on+" тримається кілька секунд, і закінчується, коли &lt;×"+v.off+" тримається ~30 с. Рівні: помірна ≥×"+v.on+", висока ≥×"+v.high+", екстремальна ≥×"+v.extreme+". Під час такої волатильності ціна ринку може швидко йти до крайніх значень і розвертатись. Це лише індикація: на сигнали та угоди вона не впливає.";
+  // the single icon: colour = strongest level among the coins, badge = how many coins are volatile right now
+  const fab=document.getElementById("vfab"),vn=document.getElementById("vfn");
+  fab.className="vfab"+(nAct?" l"+maxL+" act":"");
+  vn.style.display=nAct?"flex":"none";vn.textContent=nAct;
 }
 function render(d,sx){
   drawChart(d,sx);
-  drawVol(d,sx);
   if(sx===""){
+    drawVol(d);
     const badge=document.getElementById("badge");
     if(d.error){badge.textContent=d.error;badge.className="badge"}
     else{badge.textContent="live · "+(d.seconds_passed||0)+"s";badge.className="badge ok"}
@@ -2074,10 +2098,6 @@ function render(d,sx){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
     body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
-    const vc=d.vol&&d.vol.coins&&d.vol.coins[n];
-    if(vc&&vc.active&&vc.since){
-      body+=`<div style="font-size:.74rem;line-height:1.4;margin:-2px 0 8px;padding:0 4px;color:${VCOL[Math.max(1,vc.level)]}">⚡ ${n}: ${escH(vc.label)} волатильність ×${f(vc.ratio,1)} · з ${hms(vc.since)} (${fdur(now-vc.since)}). Ціна може різко розвернутись.</div>`;
-    }
     const fl=m.flip;
     if(fl&&!m.stale){
       const dir=fl.leader==="UP"?"ВНИЗ":"ВГОРУ",dec=n==="XRP"?4:2;
@@ -2140,6 +2160,9 @@ async function refresh(sx){
   try{render(await(await fetch("/api/status?tf="+VS[sx].tf)).json(),sx)}
   catch(e){if(sx==="")document.getElementById("badge").textContent="offline"}
 }
+document.getElementById("vfab").onclick=()=>document.getElementById("vpop").classList.add("open");
+document.getElementById("vclose").onclick=()=>document.getElementById("vpop").classList.remove("open");
+document.getElementById("vpop").onclick=e=>{if(e.target.id==="vpop")e.target.classList.remove("open")};
 for(const sx of ["","15"]){
   E("ctabs",sx).onclick=function(e){const s=e.target.dataset&&e.target.dataset.s;if(s){VS[sx].cs=s;if(VS[sx].d)drawChart(VS[sx].d,sx)}};
   E("cmode",sx).onclick=function(e){const s=e.target.dataset&&e.target.dataset.m;if(s){VS[sx].cm=s;if(VS[sx].d)drawChart(VS[sx].d,sx)}};
@@ -2401,13 +2424,6 @@ loadCal();setInterval(loadCal,30000);
 
 
 _PANELS = r"""<div class="top" id="top@@"></div>
-<div class="panel">
-  <div class="pt"><span>⚡ Волатильність</span><span id="volt@@"></span></div>
-  <div id="vol@@"></div>
-  <div class="sec" style="margin:10px 0 2px">Останні періоди</div>
-  <div id="volh@@" style="font-size:.78rem"></div>
-  <div id="volnote@@" style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px"></div>
-</div>
 <div class="panel">
   <div class="pt"><span>Ринки</span><span id="tmr@@"></span></div>
   <div class="mrow h"><div>Актив</div><div>Open</div><div>Now</div><div>Сигнал</div></div>
