@@ -134,7 +134,7 @@ class TF:
 
 
 TF5 = TF("5m", 300, "fiveminute", CONFIRM_AT, EARLY_FROM, EARLY_MIN_SPAN_MIN, CALIB_FILE)
-TF15 = TF("15m", 900, "fifteenminute", CONFIRM_AT_15, EARLY_FROM_15, EARLY_MIN_SPAN_MIN_15, CALIB_FILE_15)
+TF15 = TF("15m", 900, os.getenv("PM_VARIANT_15", "fifteen"), CONFIRM_AT_15, EARLY_FROM_15, EARLY_MIN_SPAN_MIN_15, CALIB_FILE_15)
 TFS: Dict[str, TF] = {"5m": TF5, "15m": TF15}
 
 # the original (5m) names keep working
