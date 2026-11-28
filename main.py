@@ -42,6 +42,15 @@ EARLY_MIN_MODEL_P = float(os.getenv("EARLY_MIN_MODEL_P", "0.95"))
 EARLY_MIN_SAMPLES = int(os.getenv("EARLY_MIN_SAMPLES", "300"))
 EARLY_MIN_SPAN_MIN = int(os.getenv("EARLY_MIN_SPAN_MIN", "20"))       # minutes of recorded ticks required
 PRICE_HISTORY_LEN = 60
+# ---- 15-minute forecasts: the same analysis as for 5m, scaled to a 3x longer window ----
+ENABLE_15M = os.getenv("ENABLE_15M", "true").strip().lower() == "true"
+CONFIRM_AT_15 = int(os.getenv("CONFIRM_AT_15", str(CONFIRM_AT * 3)))             # 125 s -> 375 s
+EARLY_FROM_15 = int(os.getenv("EARLY_FROM_15", str(EARLY_FROM * 3)))             # 40 s -> 120 s
+EARLY_MIN_SPAN_MIN_15 = int(os.getenv("EARLY_MIN_SPAN_MIN_15", "40"))            # minutes of recorded ticks needed
+HISTORY_KEEP = int(os.getenv("HISTORY_KEEP", "100"))                             # signals kept / shown in the history
+CALIB_CPS = (30, 60, 90, 120, 150, 180, 240)                                     # calibration checkpoints (5m window)
+CALIB_FILE = os.getenv("CALIB_FILE", "calib.json")
+CALIB_FILE_15 = os.getenv("CALIB_FILE_15", "calib15.json")
 MIN_LEAD_BPS = float(os.getenv("MIN_LEAD_BPS", "10.0"))        # lead filter (was 8 in older versions)
 MIN_MOM_SHORT = float(os.getenv("MIN_MOM_SHORT", "4.0"))        # short momentum confirmation
 MIN_MOM_MED = float(os.getenv("MIN_MOM_MED", "2.5"))          # medium momentum confirmation
@@ -60,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 
 class WindowState:
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, series_len: int = 400):
         self.symbol = symbol
         self.price_to_beat: Optional[float] = None
         self.window_start: Optional[datetime] = None
@@ -72,7 +81,7 @@ class WindowState:
         self.last_error: Optional[str] = None
         self.source: str = ""
         self.open_confirmed: bool = False  # True when open taken from Polymarket
-        self.series: deque = deque(maxlen=400)  # (seconds_in_window, price) for chart
+        self.series: deque = deque(maxlen=series_len)  # (seconds_in_window, price) for chart
         self.early: Optional[dict] = None       # early (low-confidence) forecast made right at window start
         self.prev_tail: list = []                # last prices of the previous window (trend before the start)
         self.calib_done: set = set()             # calibration checkpoints already handled in this window
@@ -98,10 +107,45 @@ class WindowState:
         self.calib_pending = []
 
 
-state: Dict[str, WindowState] = {s: WindowState(s) for s in SYMBOLS}
-signal_history: List[dict] = []
-early_history: List[dict] = []   # results of early forecasts (tracked separately from real signals)
-global_error: Optional[str] = None
+class TF:
+    """Parameters + state of one market timeframe (5m / 15m).
+    The 5m profile reproduces the original behaviour exactly (lead_scale = 1, time scale = 1).
+    Longer windows scale the lead thresholds with sqrt(time) and the timings linearly."""
+
+    def __init__(self, key: str, seconds: int, variant: str, confirm_at: int, early_from: int,
+                 early_min_span: int, calib_file: str):
+        self.key = key
+        self.seconds = seconds
+        self.variant = variant                 # `variant` parameter of polymarket.com/api/crypto/crypto-price
+        self.confirm_at = confirm_at
+        self.early_from = early_from
+        self.early_min_span = early_min_span
+        k = seconds / 300.0
+        self.time_scale = k
+        self.lead_scale = math.sqrt(k)
+        self.cps = tuple(int(round(c * k)) for c in CALIB_CPS)
+        self.state: Dict[str, WindowState] = {s: WindowState(s, int(400 * k)) for s in SYMBOLS}
+        self.signal_history: List[dict] = []
+        self.early_history: List[dict] = []    # results of early forecasts (tracked separately from real signals)
+        self.error: Optional[str] = None
+        self.calib: deque = deque(maxlen=30000)   # [coin, cp, lead_bps, up(1/0), win(1/0), ask|None, mom_bps, unix_ts]
+        self.calib_file = calib_file
+        self.calib_saved_at = 0.0
+
+
+TF5 = TF("5m", 300, "fiveminute", CONFIRM_AT, EARLY_FROM, EARLY_MIN_SPAN_MIN, CALIB_FILE)
+TF15 = TF("15m", 900, "fifteenminute", CONFIRM_AT_15, EARLY_FROM_15, EARLY_MIN_SPAN_MIN_15, CALIB_FILE_15)
+TFS: Dict[str, TF] = {"5m": TF5, "15m": TF15}
+
+# the original (5m) names keep working
+state = TF5.state
+signal_history = TF5.signal_history
+early_history = TF5.early_history
+
+
+def _tf_from(request) -> TF:
+    """?tf=15m selects the 15-minute profile; anything else = 5m."""
+    return TFS.get((request.query_params.get("tf") or "5m").lower(), TF5)
 live_chainlink: Dict[str, float] = {}  # symbol -> last chainlink price
 
 
@@ -111,7 +155,7 @@ def momentum_bps(prices: deque, lookback: int = 12) -> float:
     return (prices[-1] - prices[-lookback]) / prices[-lookback] * 10000
 
 
-def generate_signal(price_to_beat: float, current_price: float, seconds_passed: int, prices: deque) -> dict:
+def generate_signal(price_to_beat: float, current_price: float, seconds_passed: int, prices: deque, tf: Optional["TF"] = None) -> dict:
     """
     Multi-factor signal inspired by jury-style bots:
     - Judge 1: Lead vs priceToBeat (Chainlink open)
@@ -119,14 +163,17 @@ def generate_signal(price_to_beat: float, current_price: float, seconds_passed: 
     - Judge 3: Medium momentum (last ~25 ticks)
     Only fire when majority agree + strong enough edge.
     """
-    if seconds_passed < CONFIRM_AT:
+    tf = tf or TF5
+    if seconds_passed < tf.confirm_at:
         return {"side": None, "confidence": 0.0, "reason": "too_early", "score": 0}
 
     lead_bps = ((current_price - price_to_beat) / price_to_beat) * 10000
-    time_left = WINDOW_SECONDS - seconds_passed
+    time_left = tf.seconds - seconds_passed
     abs_lead = abs(lead_bps)
+    ls, k = tf.lead_scale, tf.time_scale          # both 1.0 for 5m
+    min_lead = MIN_LEAD_BPS * ls
 
-    if abs_lead < MIN_LEAD_BPS:
+    if abs_lead < min_lead:
         return {"side": None, "confidence": 0.0, "reason": "too_small_lead", "score": 0, "lead_bps": round(lead_bps, 2)}
 
     mom_short = momentum_bps(prices, lookback=12)
@@ -137,7 +184,7 @@ def generate_signal(price_to_beat: float, current_price: float, seconds_passed: 
     # Jury votes
     votes = 0
     # Judge 1: lead
-    if abs_lead >= MIN_LEAD_BPS:
+    if abs_lead >= min_lead:
         votes += 1
     # Judge 2: short momentum same direction
     if (side == "UP" and mom_short >= MIN_MOM_SHORT) or (side == "DOWN" and mom_short <= -MIN_MOM_SHORT):
@@ -159,11 +206,11 @@ def generate_signal(price_to_beat: float, current_price: float, seconds_passed: 
 
     # Confidence curve: later + stronger lead = higher conf
     base = 0.72 + (votes - 2) * 0.06          # 2 votes → 0.72, 3 votes → 0.78
-    lead_boost = min(abs_lead * 0.011, 0.14)
+    lead_boost = min((abs_lead / ls) * 0.011, 0.14)
     time_boost = 0.0
-    if time_left <= 45:
+    if time_left <= 45 * k:
         time_boost = 0.08
-    elif time_left <= 70:
+    elif time_left <= 70 * k:
         time_boost = 0.04
 
     confidence = min(base + lead_boost + time_boost, 0.96)
@@ -198,14 +245,14 @@ def realized_sigma(series, max_pts: int = 80) -> Optional[float]:
     return max(math.sqrt(s2 / total), 3e-5)
 
 
-def model_prob_up(open_px: Optional[float], price: float, t_now: float, series) -> Optional[float]:
+def model_prob_up(open_px: Optional[float], price: float, t_now: float, series, T: Optional[float] = None) -> Optional[float]:
     """P(final 60s TWAP >= open) for a driftless random walk (idea: Black-Scholes style HFT bot, TWAP variant)."""
     if not open_px or not price:
         return None
     sig = realized_sigma(series)
     if sig is None:
         return None
-    W, T = 60.0, float(WINDOW_SECONDS)
+    W, T = 60.0, float(T or WINDOW_SECONDS)
     sigma = sig * price
     if t_now <= T - W:
         a = (T - W) - t_now
@@ -233,13 +280,14 @@ def is_strong_signal(signal: dict) -> bool:
     return signal.get("confidence", 0) >= MIN_CONFIDENCE and signal.get("score", 0) >= 2
 
 
-def get_window_start_unix() -> int:
+def get_window_start_unix(tf: Optional[TF] = None) -> int:
+    secs = tf.seconds if tf else WINDOW_SECONDS
     now = int(datetime.now(timezone.utc).timestamp())
-    return now - (now % WINDOW_SECONDS)
+    return now - (now % secs)
 
 
-def get_current_window_start() -> datetime:
-    return datetime.fromtimestamp(get_window_start_unix(), tz=timezone.utc)
+def get_current_window_start(tf: Optional[TF] = None) -> datetime:
+    return datetime.fromtimestamp(get_window_start_unix(tf), tz=timezone.utc)
 
 
 def twap_last_seconds(series, seconds: float = 60.0) -> Optional[float]:
@@ -251,24 +299,25 @@ def twap_last_seconds(series, seconds: float = 60.0) -> Optional[float]:
     return sum(pts) / len(pts) if pts else None
 
 
-def twap_final_minute(series) -> Optional[float]:
-    """Average of the ticks in the final minute of the window (t in [240, 300])."""
-    pts = [p for t, p in series if t >= WINDOW_SECONDS - 60]
+def twap_final_minute(series, secs: int = WINDOW_SECONDS) -> Optional[float]:
+    """Average of the ticks in the final minute of the window (t in [secs-60, secs])."""
+    pts = [p for t, p in series if t >= secs - 60]
     return sum(pts) / len(pts) if len(pts) >= 5 else None
 
 
-async def fetch_polymarket_open(client: httpx.AsyncClient, symbol: str, start_unix: int) -> Optional[float]:
+async def fetch_polymarket_open(client: httpx.AsyncClient, symbol: str, start_unix: int, tf: Optional[TF] = None) -> Optional[float]:
     """Price to Beat straight from Polymarket (same endpoint the website uses)."""
+    secs, variant = (tf.seconds, tf.variant) if tf else (WINDOW_SECONDS, "fiveminute")
     base = symbol.replace("USDT", "")
     start_iso = datetime.fromtimestamp(start_unix, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_iso = datetime.fromtimestamp(start_unix + WINDOW_SECONDS, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = datetime.fromtimestamp(start_unix + secs, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         r = await client.get(
             "https://polymarket.com/api/crypto/crypto-price",
             params={
                 "symbol": base,
                 "eventStartTime": start_iso,
-                "variant": "fiveminute",
+                "variant": variant,
                 "endDate": end_iso,
             },
             timeout=3.0,
@@ -282,15 +331,16 @@ async def fetch_polymarket_open(client: httpx.AsyncClient, symbol: str, start_un
     return None
 
 
-async def fetch_polymarket_close(client: httpx.AsyncClient, symbol: str, start_unix: int) -> Optional[float]:
+async def fetch_polymarket_close(client: httpx.AsyncClient, symbol: str, start_unix: int, tf: Optional[TF] = None) -> Optional[float]:
     """Final price of a finished window straight from Polymarket."""
+    secs, variant = (tf.seconds, tf.variant) if tf else (WINDOW_SECONDS, "fiveminute")
     base = symbol.replace("USDT", "")
     start_iso = datetime.fromtimestamp(start_unix, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_iso = datetime.fromtimestamp(start_unix + WINDOW_SECONDS, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = datetime.fromtimestamp(start_unix + secs, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         r = await client.get(
             "https://polymarket.com/api/crypto/crypto-price",
-            params={"symbol": base, "eventStartTime": start_iso, "variant": "fiveminute", "endDate": end_iso},
+            params={"symbol": base, "eventStartTime": start_iso, "variant": variant, "endDate": end_iso},
             timeout=3.0,
         )
         if r.status_code == 200:
@@ -302,16 +352,18 @@ async def fetch_polymarket_close(client: httpx.AsyncClient, symbol: str, start_u
     return None
 
 
-# ====================== Virtual (paper) trading ======================
+# ====================== Virtual (paper) trading: 3 independent wallets ======================
 PAPER_FILE = os.getenv("PAPER_FILE", "paper_state.json")
 PAPER_FEE_RATE = 0.25      # approx. Polymarket crypto taker fee: fee = shares * 0.25 * (p*(1-p))**2
 PAPER_COINS = ["BTC", "ETH", "SOL", "XRP"]
 PAPER_MODEL_HAIRCUT = 0.02   # safety haircut on the model probability
 PAPER_KELLY_CAP = 0.10       # never stake more than 10% of balance
+PAPER_N = 3                  # number of virtual wallets (each has its own settings, balance and history)
 
 
-def _paper_default() -> dict:
+def _paper_default(name: str = "") -> dict:
     return {
+        "name": name,
         "enabled": False,
         "deposit": 1000.0,
         "balance": 1000.0,
@@ -326,29 +378,44 @@ def _paper_default() -> dict:
     }
 
 
-paper: dict = _paper_default()
+wallets: List[dict] = [_paper_default(f"Гаманець {i + 1}") for i in range(PAPER_N)]
+# Wallet 1 keeps the old name `paper`: real-money (live) trading mirrors ONLY this wallet.
+paper: dict = wallets[0]
 
 
 def paper_save():
     try:
         tmp = PAPER_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(paper, f)
+            json.dump({"version": 2, "wallets": wallets}, f)
         os.replace(tmp, PAPER_FILE)
     except Exception as e:
         logger.warning(f"paper save failed: {e}")
+
+
+def _paper_apply(w: dict, data: dict, idx: int):
+    base = _paper_default(f"Гаманець {idx + 1}")
+    base.update({k: v for k, v in data.items() if k in base})
+    base["coins"] = {c: bool((data.get("coins") or {}).get(c, True)) for c in PAPER_COINS}
+    nm = str(base.get("name") or "").strip()[:24]
+    base["name"] = nm or f"Гаманець {idx + 1}"
+    w.clear()
+    w.update(base)
 
 
 def paper_load():
     try:
         with open(PAPER_FILE) as f:
             data = json.load(f)
-        base = _paper_default()
-        base.update({k: v for k, v in data.items() if k in base})
-        base["coins"] = {c: bool((data.get("coins") or {}).get(c, True)) for c in PAPER_COINS}
-        paper.clear()
-        paper.update(base)
-        logger.info(f"paper state loaded: balance={paper['balance']:.2f}, trades={len(paper['trades'])}")
+        if isinstance(data, dict) and isinstance(data.get("wallets"), list):
+            items = data["wallets"]
+        else:
+            items = [data]          # old single-wallet file -> becomes wallet 1, nothing is lost
+        for i, w in enumerate(wallets):
+            if i < len(items) and isinstance(items[i], dict):
+                _paper_apply(w, items[i], i)
+        logger.info("paper state loaded: " + ", ".join(
+            f"{w['name']}: balance={w['balance']:.2f}, trades={len(w['trades'])}" for w in wallets))
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -365,7 +432,7 @@ def _json_list(v):
 
 
 async def paper_market_meta(client: httpx.AsyncClient, slug: str):
-    """(conditionId, {token_id: 'Up'/'Down'}) for a 5m market."""
+    """(conditionId, {token_id: 'Up'/'Down'}) for a 5m / 15m market."""
     meta = _cid_cache.get(slug)
     if meta:
         return meta
@@ -395,22 +462,22 @@ def spawn(coro):
     return t
 
 
-def paper_skip(coin: str, side: str, start_unix: int, reason: str):
+def paper_skip(w: dict, coin: str, side: str, start_unix: int, reason: str):
     """Record why a signal was not traded (shown in the UI, not counted in stats)."""
-    logger.info(f"paper: skipped {coin} {side}: {reason}")
-    paper["trades"].insert(0, {
-        "id": paper["next_id"], "ts": int(datetime.now(timezone.utc).timestamp()),
+    logger.info(f"paper[{w['name']}]: skipped {coin} {side}: {reason}")
+    w["trades"].insert(0, {
+        "id": w["next_id"], "ts": int(datetime.now(timezone.utc).timestamp()),
         "symbol": coin, "side": side, "window_start": start_unix,
         "entry": 0.0, "shares": 0.0, "cost": 0.0, "fee": 0.0,
         "status": "skip", "reason": reason, "pnl": 0.0, "settled_at": None, "balance_after": None,
     })
-    paper["next_id"] += 1
+    w["next_id"] += 1
     paper_save()
 
 
-async def _paper_get_asks(client: httpx.AsyncClient, coin: str, side: str, start_unix: int):
+async def _paper_get_asks(client: httpx.AsyncClient, coin: str, side: str, start_unix: int, tf: Optional[TF] = None):
     """Order-book asks for the side we want. Retries a few times. Returns (asks, reason)."""
-    slug = f"{coin.lower()}-updown-5m-{start_unix}"
+    slug = f"{coin.lower()}-updown-{tf.key if tf else '5m'}-{start_unix}"
     reason = "невідома помилка"
     for attempt in range(3):
         try:
@@ -444,55 +511,50 @@ async def _paper_get_asks(client: httpx.AsyncClient, coin: str, side: str, start
     return None, reason
 
 
-async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int, p_model: Optional[float] = None,
-                     mode: str = "confirm"):
-    """Open a virtual position at the real Polymarket order book (walks the asks)."""
-    coin = symbol.replace("USDT", "")
+def _paper_open_w(w: dict, client: httpx.AsyncClient, coin: str, side: str, start_unix: int,
+                  p_model: Optional[float], mode: str, asks, reason):
+    """Open a virtual position for ONE wallet at the real order book (walks the asks). No awaits: atomic."""
     try:
-        if not paper["enabled"] or not paper["coins"].get(coin):
+        # state may have changed while we were waiting for the network
+        if not w["enabled"] or not w["coins"].get(coin):
             return
         if any(t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix
-               for t in paper["trades"]):
-            return
-        asks, reason = await _paper_get_asks(client, coin, side, start_unix)
-
-        # state may have changed while we were waiting for the network
-        if not paper["enabled"] or not paper["coins"].get(coin):
+               for t in w["trades"]):
             return
         if not asks:
-            paper_skip(coin, side, start_unix, reason or "немає даних")
+            paper_skip(w, coin, side, start_unix, reason or "немає даних")
             return
-        bal = paper["balance"]
+        bal = w["balance"]
         best = asks[0][0]
-        if best * 100 < paper.get("min_price", 0):
-            paper_skip(coin, side, start_unix, f"ціна сторони {best*100:.0f}¢ нижча за мін. {paper['min_price']}¢")
+        if best * 100 < w.get("min_price", 0):
+            paper_skip(w, coin, side, start_unix, f"ціна сторони {best*100:.0f}¢ нижча за мін. {w['min_price']}¢")
             return
-        if best * 100 > paper.get("max_price", 99):
-            paper_skip(coin, side, start_unix, f"ціна {best*100:.0f}¢ вища за макс. {paper['max_price']}¢")
+        if best * 100 > w.get("max_price", 99):
+            paper_skip(w, coin, side, start_unix, f"ціна {best*100:.0f}¢ вища за макс. {w['max_price']}¢")
             return
         p_eff = (p_model - PAPER_MODEL_HAIRCUT) if p_model is not None else None
         c_best = best + fee_per_share(best)
         edge_best = (p_eff - c_best) if p_eff is not None else None
-        if paper.get("min_edge", 0) > 0:
+        if w.get("min_edge", 0) > 0:
             if edge_best is None:
-                paper_skip(coin, side, start_unix, "немає моделі для перевірки edge")
+                paper_skip(w, coin, side, start_unix, "немає моделі для перевірки edge")
                 return
-            if edge_best * 100 < paper["min_edge"]:
-                paper_skip(coin, side, start_unix, f"edge {edge_best*100:.1f}% < мін. {paper['min_edge']:.1f}%")
+            if edge_best * 100 < w["min_edge"]:
+                paper_skip(w, coin, side, start_unix, f"edge {edge_best*100:.1f}% < мін. {w['min_edge']:.1f}%")
                 return
-        if paper["stake_mode"] == "kelly":
+        if w["stake_mode"] == "kelly":
             if edge_best is None or edge_best <= 0:
-                paper_skip(coin, side, start_unix, "Kelly: edge ≤ 0 або немає моделі")
+                paper_skip(w, coin, side, start_unix, "Kelly: edge ≤ 0 або немає моделі")
                 return
             f_full = (p_eff - c_best) / (1.0 - c_best)
-            stake = bal * min(f_full * paper["stake_value"] / 100.0, PAPER_KELLY_CAP)
-        elif paper["stake_mode"] == "pct":
-            stake = bal * paper["stake_value"] / 100.0
+            stake = bal * min(f_full * w["stake_value"] / 100.0, PAPER_KELLY_CAP)
+        elif w["stake_mode"] == "pct":
+            stake = bal * w["stake_value"] / 100.0
         else:
-            stake = paper["stake_value"]
+            stake = w["stake_value"]
         stake = min(stake, bal)
         if stake < 1:
-            paper_skip(coin, side, start_unix, "ставка менша за $1 (баланс або Kelly замалі)")
+            paper_skip(w, coin, side, start_unix, "ставка менша за $1 (баланс або Kelly замалі)")
             return
 
         remaining, shares, cost = stake, 0.0, 0.0
@@ -504,17 +566,17 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
             if remaining < 0.01:
                 break
         if shares <= 0 or cost < 1:
-            paper_skip(coin, side, start_unix, "замало ліквідності")
+            paper_skip(w, coin, side, start_unix, "замало ліквідності")
             return
         avg = cost / shares
         fee = shares * PAPER_FEE_RATE * (avg * (1 - avg)) ** 2
         total = cost + fee
-        if total > paper["balance"]:
-            k = paper["balance"] / total
+        if total > w["balance"]:
+            k = w["balance"] / total
             shares, cost, fee, total = shares * k, cost * k, fee * k, total * k
-        paper["balance"] -= total
+        w["balance"] -= total
         trade = {
-            "id": paper["next_id"],
+            "id": w["next_id"],
             "ts": int(datetime.now(timezone.utc).timestamp()),
             "symbol": coin,
             "side": side,
@@ -530,65 +592,89 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
             "settled_at": None,
             "balance_after": None,
         }
-        paper["next_id"] += 1
-        paper["trades"].insert(0, trade)
-        if len(paper["trades"]) > 400:
-            keep_open = [t for t in paper["trades"] if t["status"] == "open"]
-            closed = [t for t in paper["trades"] if t["status"] != "open"][:300]
-            paper["trades"] = sorted(keep_open + closed, key=lambda t: t["id"], reverse=True)
+        w["next_id"] += 1
+        w["trades"].insert(0, trade)
+        if len(w["trades"]) > 400:
+            keep_open = [t for t in w["trades"] if t["status"] == "open"]
+            closed = [t for t in w["trades"] if t["status"] != "open"][:300]
+            w["trades"] = sorted(keep_open + closed, key=lambda t: t["id"], reverse=True)
         paper_save()
-        logger.info(f"PAPER BUY {coin} {side} {shares:.2f} sh @ {avg:.3f} cost ${cost:.2f} fee ${fee:.3f}")
-        if live_rt["armed"] and (mode != "early" or LIVE_ALLOW_EARLY):
+        logger.info(f"PAPER[{w['name']}] BUY {coin} {side} {shares:.2f} sh @ {avg:.3f} cost ${cost:.2f} fee ${fee:.3f}")
+        # real money mirrors wallet 1 only (its filters decide whether a live order is even attempted)
+        if w is wallets[0] and live_rt["armed"] and (mode != "early" or LIVE_ALLOW_EARLY):
             spawn(live_buy(client, coin, side, start_unix, trade))
     except Exception as e:
-        logger.warning(f"paper_open error: {e}")
+        logger.warning(f"paper_open error [{w.get('name')}]: {e}")
         try:
-            paper_skip(coin, side, start_unix, "внутрішня помилка")
+            paper_skip(w, coin, side, start_unix, "внутрішня помилка")
         except Exception:
             pass
 
 
+async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int, p_model: Optional[float] = None,
+                     mode: str = "confirm"):
+    """A 5m signal fired: every enabled wallet decides on its own (own filters / stake). The order book is fetched once."""
+    coin = symbol.replace("USDT", "")
+    try:
+        def wants(w):
+            return bool(w["enabled"] and w["coins"].get(coin)) and not any(
+                t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix for t in w["trades"])
+        if not any(wants(w) for w in wallets):
+            return
+        asks, reason = await _paper_get_asks(client, coin, side, start_unix)
+        for w in wallets:
+            _paper_open_w(w, client, coin, side, start_unix, p_model, mode, asks, reason)
+    except Exception as e:
+        logger.warning(f"paper_open dispatcher error: {e}")
+
+
 def paper_settle(coin: str, start_unix: int, actual: str) -> bool:
     live_settle(coin, start_unix, actual)
-    for t in paper["trades"]:
-        if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix:
-            won = t["side"] == actual
-            if won:
-                paper["balance"] += t["shares"]
-                t["pnl"] = round(t["shares"] - t["cost"] - t["fee"], 2)
-                t["status"] = "win"
-            else:
-                t["pnl"] = round(-(t["cost"] + t["fee"]), 2)
-                t["status"] = "loss"
-            t["settled_at"] = int(datetime.now(timezone.utc).timestamp())
-            t["balance_after"] = round(paper["balance"], 2)
-            paper_save()
-            logger.info(f"PAPER {t['status'].upper()} {coin} {t['side']} pnl ${t['pnl']:.2f}")
-            return True
-    return False
+    done = False
+    for w in wallets:
+        for t in w["trades"]:
+            if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix:
+                won = t["side"] == actual
+                if won:
+                    w["balance"] += t["shares"]
+                    t["pnl"] = round(t["shares"] - t["cost"] - t["fee"], 2)
+                    t["status"] = "win"
+                else:
+                    t["pnl"] = round(-(t["cost"] + t["fee"]), 2)
+                    t["status"] = "loss"
+                t["settled_at"] = int(datetime.now(timezone.utc).timestamp())
+                t["balance_after"] = round(w["balance"], 2)
+                paper_save()
+                logger.info(f"PAPER[{w['name']}] {t['status'].upper()} {coin} {t['side']} pnl ${t['pnl']:.2f}")
+                done = True
+                break
+    return done
 
 
-def paper_void(t: dict):
-    paper["balance"] += t["cost"] + t["fee"]
+def paper_void(w: dict, t: dict):
+    w["balance"] += t["cost"] + t["fee"]
     t["status"] = "void"
     t["pnl"] = 0.0
     t["settled_at"] = int(datetime.now(timezone.utc).timestamp())
-    t["balance_after"] = round(paper["balance"], 2)
+    t["balance_after"] = round(w["balance"], 2)
     paper_save()
 
 
 async def paper_settle_orphans(client: httpx.AsyncClient, symbol: str, start_unix: int):
     """Settle positions whose window ended but the normal close step missed them (e.g. after a restart)."""
     coin = symbol.replace("USDT", "")
-    for t in list(paper["trades"]):
-        if t["status"] != "open" or t["symbol"] != coin or t["window_start"] >= start_unix:
-            continue
-        o = await fetch_polymarket_open(client, symbol, t["window_start"])
-        c = await fetch_polymarket_close(client, symbol, t["window_start"])
+    starts = sorted({t["window_start"] for w in wallets for t in w["trades"]
+                     if t["status"] == "open" and t["symbol"] == coin and t["window_start"] < start_unix})
+    for ws_start in starts:
+        o = await fetch_polymarket_open(client, symbol, ws_start)
+        c = await fetch_polymarket_close(client, symbol, ws_start)
         if o is not None and c is not None:
-            paper_settle(coin, t["window_start"], "UP" if c >= o else "DOWN")
-        elif t["window_start"] < start_unix - 1200:
-            paper_void(t)
+            paper_settle(coin, ws_start, "UP" if c >= o else "DOWN")
+        elif ws_start < start_unix - 1200:
+            for w in wallets:
+                for t in list(w["trades"]):
+                    if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == ws_start:
+                        paper_void(w, t)
     for t in list(live["trades"]):
         if t["status"] != "open" or t["symbol"] != coin or t["window_start"] >= start_unix:
             continue
@@ -932,7 +1018,7 @@ async def api_live_arm(request):
         live_rt["last_error"] = "Не готово: " + ", ".join(miss)
         return JSONResponse(_live_payload())
     if not paper["enabled"]:
-        live_rt["last_error"] = "Спочатку увімкни «Торгувати віртуально»: live повторює її угоди та фільтри"
+        live_rt["last_error"] = "Спочатку увімкни «Торгувати віртуально» у Гаманці 1: live повторює його угоди та фільтри"
         return JSONResponse(_live_payload())
     try:
         await live_client()          # preflight: authenticates key + wallet, places NO order
@@ -949,48 +1035,45 @@ async def api_live_arm(request):
 # At fixed seconds of every window the bot records: the current leader (side with price above/below open), the lead in bps,
 # the real Polymarket best ask for that side, and later the real result. The table then shows, per moment in the window,
 # how often the leader really won, what the market charged for it, and the average real result per share after fees.
-CALIB_CPS = (30, 60, 90, 120, 150, 180, 240)
 CALIB_THRS = (0.0, 3.0, 6.0, 10.0)               # min |lead| in bps for the table filters
-CALIB_FILE = os.getenv("CALIB_FILE", "calib.json")
-calib: deque = deque(maxlen=30000)               # [coin, cp, lead_bps, up(1/0), win(1/0), ask|None, mom_bps, unix_ts]
-_calib_saved_at = 0.0
 
 
-def calib_load():
+def calib_load(tf: TF):
     try:
-        with open(CALIB_FILE) as f:
+        with open(tf.calib_file) as f:
             for row in json.load(f):
                 if isinstance(row, list) and len(row) == 8:
-                    calib.append(row)
-        logger.info(f"calibration loaded: {len(calib)} samples")
+                    tf.calib.append(row)
+        logger.info(f"calibration {tf.key} loaded: {len(tf.calib)} samples")
     except FileNotFoundError:
         pass
     except Exception as e:
         logger.warning(f"calib load failed: {e}")
 
 
-def calib_save(force: bool = False):
-    global _calib_saved_at
-    if not force and time.time() - _calib_saved_at < 120:
+def calib_save(tf: TF, force: bool = False):
+    if not force and time.time() - tf.calib_saved_at < 120:
         return
-    _calib_saved_at = time.time()
+    tf.calib_saved_at = time.time()
     try:
-        tmp = CALIB_FILE + ".tmp"
+        tmp = tf.calib_file + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(list(calib), f, separators=(",", ":"))
-        os.replace(tmp, CALIB_FILE)
+            json.dump(list(tf.calib), f, separators=(",", ":"))
+        os.replace(tmp, tf.calib_file)
     except Exception as e:
         logger.warning(f"calib save failed: {e}")
 
 
-calib_load()
+calib_load(TF5)
+calib_load(TF15)
 
 
-async def calib_fill_ask(client: httpx.AsyncClient, symbol: str, start_unix: int, sample: dict):
+async def calib_fill_ask(client: httpx.AsyncClient, symbol: str, start_unix: int, sample: dict, tf: Optional[TF] = None):
     """Best ask (what the market charges) for the leader side at the checkpoint. Best effort, single request."""
+    tf = tf or TF5
     try:
         coin = symbol.replace("USDT", "")
-        meta = await paper_market_meta(client, f"{coin.lower()}-updown-5m-{start_unix}")
+        meta = await paper_market_meta(client, f"{coin.lower()}-updown-{tf.key}-{start_unix}")
         if not meta:
             return
         want = "up" if sample["side"] == "UP" else "down"
@@ -1012,50 +1095,53 @@ async def calib_fill_ask(client: httpx.AsyncClient, symbol: str, start_unix: int
         logger.debug(f"calib ask {symbol}: {e}")
 
 
-def _own_final_price(symbol: str, start_unix: int) -> Optional[float]:
+def _own_final_price(symbol: str, start_unix: int, secs: int = WINDOW_SECONDS) -> Optional[float]:
     """Last recorded Chainlink tick at the end of the window (the same feed Polymarket settles on).
     Used only when Polymarket does not return the exact close price; None if our ticks do not reach the window end."""
-    end = start_unix + WINDOW_SECONDS
+    end = start_unix + secs
     for t, p in reversed(tick_hist.get(symbol, ())):
         if t <= end:
             return p if end - t <= 8 else None
     return None
 
 
-async def calib_settle(client: httpx.AsyncClient, symbol: str, start_unix: int, pending: list, open_px: Optional[float]):
+async def calib_settle(client: httpx.AsyncClient, symbol: str, start_unix: int, pending: list, open_px: Optional[float],
+                       tf: Optional[TF] = None):
     """Attach the real result to the samples of a finished window.
     1) the exact close price from Polymarket (it can appear a while after the window ends, so be patient: ~3 min);
     2) otherwise our own last Chainlink tick of the window; 3) otherwise the samples are dropped (and counted)."""
+    tf = tf or TF5
     try:
         final, src_name = None, ""
         for i in range(14):
-            final = await fetch_polymarket_close(client, symbol, start_unix)
+            final = await fetch_polymarket_close(client, symbol, start_unix, tf)
             if final is not None:
                 src_name = "exact"
                 break
             await asyncio.sleep(4 if i < 2 else 15)
         if final is None:
-            final = _own_final_price(symbol, start_unix)
+            final = _own_final_price(symbol, start_unix, tf.seconds)
             src_name = "own_ticks"
         if final is None or not open_px:
             diag["calib"]["dropped"] += len(pending)
-            logger.info(f"calib {symbol}: no result for window {start_unix}, {len(pending)} samples dropped")
+            logger.info(f"calib {tf.key} {symbol}: no result for window {start_unix}, {len(pending)} samples dropped")
             return
         outcome = "UP" if final >= open_px else "DOWN"
-        for s in pending:
-            calib.append([s["coin"], s["cp"], s["lead"], 1 if s["side"] == "UP" else 0,
-                          1 if s["side"] == outcome else 0, s.get("ask"), s["mom"], s["ts"]])
+        for s_ in pending:
+            tf.calib.append([s_["coin"], s_["cp"], s_["lead"], 1 if s_["side"] == "UP" else 0,
+                             1 if s_["side"] == outcome else 0, s_.get("ask"), s_["mom"], s_["ts"]])
         diag["calib"][src_name] += len(pending)
-        calib_save()
+        calib_save(tf)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.warning(f"calib settle {symbol}: {e}")
 
 
-def calib_stats() -> dict:
-    acc = {thr: {cp: [0, 0, 0, 0.0, 0.0] for cp in CALIB_CPS} for thr in CALIB_THRS}   # n, wins, n_ask, sum_ask, sum_pnl
-    for coin, cp, lead, up, win, ask, mom, ts in calib:
+def calib_stats(tf: Optional[TF] = None) -> dict:
+    tf = tf or TF5
+    acc = {thr: {cp: [0, 0, 0, 0.0, 0.0] for cp in tf.cps} for thr in CALIB_THRS}   # n, wins, n_ask, sum_ask, sum_pnl
+    for coin, cp, lead, up, win, ask, mom, ts in tf.calib:
         if cp not in acc[0.0]:
             continue
         for thr in CALIB_THRS:
@@ -1070,7 +1156,7 @@ def calib_stats() -> dict:
     out = {}
     for thr in CALIB_THRS:
         rows = []
-        for cp in CALIB_CPS:
+        for cp in tf.cps:
             n, w, na, sa, sp = acc[thr][cp]
             rows.append({
                 "cp": cp, "n": n,
@@ -1084,7 +1170,8 @@ def calib_stats() -> dict:
 
 
 async def api_calib(request):
-    return JSONResponse({"total": len(calib), "thresholds": [int(t) for t in CALIB_THRS], "rows": calib_stats()})
+    tf = _tf_from(request)
+    return JSONResponse({"total": len(tf.calib), "thresholds": [int(t) for t in CALIB_THRS], "rows": calib_stats(tf)})
 
 
 # ====================== Reversal reserve (facts from real ticks) ======================
@@ -1127,27 +1214,28 @@ def reversal_stats(symbol: str, lead_bps: float, horizon_sec: float) -> Optional
     return {"samples": samples, "hits": hits, "span_min": int(span // 60)}
 
 
-def early_signal(symbol: str, ws, price: float, seconds_passed: int) -> Optional[dict]:
+def early_signal(symbol: str, ws, price: float, seconds_passed: int, tf: Optional[TF] = None) -> Optional[dict]:
     """Signal BEFORE the regular confirmation time. Returns None unless the evidence is strong:
     a big lead, momentum not reversing, >= 20 min of recorded ticks, (almost) no reversals of this size in that
     history for the time left, AND the random-walk model agrees."""
+    tf = tf or TF5
     if not ws.price_to_beat or ws.price_to_beat <= 0:
         return None
     lead = (price - ws.price_to_beat) / ws.price_to_beat * 10000
-    if abs(lead) < EARLY_MIN_LEAD_BPS:
+    if abs(lead) < EARLY_MIN_LEAD_BPS * tf.lead_scale:
         return None
     side = "UP" if lead > 0 else "DOWN"
     mom = momentum_bps(ws.prices, lookback=12)
     if (side == "UP" and mom < 0) or (side == "DOWN" and mom > 0):
         return None                                   # price is already moving back toward open
-    time_left = WINDOW_SECONDS - seconds_passed
+    time_left = tf.seconds - seconds_passed
     st = reversal_stats(symbol, lead, time_left)
-    if not st or st["samples"] < EARLY_MIN_SAMPLES or st["span_min"] < EARLY_MIN_SPAN_MIN:
+    if not st or st["samples"] < EARLY_MIN_SAMPLES or st["span_min"] < tf.early_min_span:
         return None
     rate = st["hits"] / st["samples"]
     if rate > EARLY_MAX_REVERSAL:
         return None
-    p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+    p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series, tf.seconds)
     if p_up is None:
         return None
     p_side = p_up if side == "UP" else 1.0 - p_up
@@ -1166,13 +1254,143 @@ def early_signal(symbol: str, ws, price: float, seconds_passed: int) -> Optional
     }
 
 
-async def _attach_mkt_price(client: httpx.AsyncClient, entry: dict, coin: str, side: str, start_unix: int):
+async def _attach_mkt_price(client: httpx.AsyncClient, entry: dict, coin: str, side: str, start_unix: int,
+                            tf: Optional[TF] = None):
     """Remember what the crowd was paying (best ask) when the signal fired."""
     try:
-        asks, _ = await _paper_get_asks(client, coin, side, start_unix)
+        asks, _ = await _paper_get_asks(client, coin, side, start_unix, tf)
         entry["mkt_price"] = round(asks[0][0], 3) if asks else None
     except Exception as e:
         logger.debug(f"mkt price: {e}")
+
+
+# ====================== Volatility monitor ======================
+# Compares how fast the REAL Chainlink price moved over the last ~45 s with the coin's own normal level
+# (median of per-minute realized volatility over the recorded history). Ratio x1.0 = normal.
+# An "event" starts when the ratio stays >= VOL_ON for a few seconds and ends when it stays < VOL_OFF for ~30 s.
+# This is display only: it does NOT change signals or trades.
+VOL_SHORT_SEC = float(os.getenv("VOL_SHORT_SEC", "45"))
+VOL_ON = float(os.getenv("VOL_ON", "2.0"))
+VOL_OFF = float(os.getenv("VOL_OFF", "1.4"))
+VOL_HIGH = float(os.getenv("VOL_HIGH", "3.0"))
+VOL_EXTREME = float(os.getenv("VOL_EXTREME", "4.5"))
+VOL_START_HOLD = 8.0       # seconds the ratio must stay above VOL_ON before an event is declared (start time = first moment above)
+VOL_END_HOLD = 30.0        # seconds below VOL_OFF before the event is declared over (end time = first moment below)
+VOL_MIN_HISTORY_SEC = 600  # need >= 10 min of recorded ticks to know what "normal" is
+VOL_LEVELS = {0: "спокійно", 1: "помірна", 2: "висока", 3: "екстремальна"}
+
+vol_state: Dict[str, dict] = {s: {"active": False, "first_above": None, "below_since": None, "ratio": None, "level": 0,
+                                  "warm": True, "now_bps": None, "typ_bps": None, "range_bps": None, "event": None}
+                              for s in SYMBOLS}
+vol_events: List[dict] = []      # newest first; a running event stays in this list and is updated in place
+_vol_seq = 0
+
+
+def _vol_level(r: float) -> int:
+    return 3 if r >= VOL_EXTREME else 2 if r >= VOL_HIGH else 1 if r >= VOL_ON else 0
+
+
+def vol_measure(symbol: str) -> Optional[dict]:
+    pts = list(tick_hist[symbol])
+    if len(pts) < 60:
+        return None
+    t_end = pts[-1][0]
+    if t_end - pts[0][0] < VOL_MIN_HISTORY_SEC:
+        return {"warm": True}
+    cut = t_end - VOL_SHORT_SEC
+    s2_short = dt_short = 0.0
+    buckets: Dict[int, list] = {}
+    lo = hi = pts[-1][1]
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        dt = t1 - t0
+        if dt <= 0 or dt > 5.0 or p0 <= 0 or p1 <= 0:      # skip data gaps (reconnects)
+            continue
+        r = math.log(p1 / p0)
+        if t1 >= cut:
+            s2_short += r * r
+            dt_short += dt
+            lo, hi = min(lo, p1), max(hi, p1)
+        elif t1 < cut - 30:                                # the baseline never includes the window being judged
+            b = buckets.setdefault(int(t1 // 60), [0.0, 0.0])
+            b[0] += r * r
+            b[1] += dt
+    base_list = sorted(math.sqrt(b[0] / b[1]) for b in buckets.values() if b[1] >= 30)
+    if len(base_list) < 6 or dt_short < 15:
+        return {"warm": True}
+    base = max(base_list[len(base_list) // 2], 5e-6)
+    short = math.sqrt(s2_short / dt_short)
+    k = math.sqrt(VOL_SHORT_SEC) * 10000.0                  # per-sqrt-second -> bps over VOL_SHORT_SEC
+    price = pts[-1][1]
+    return {"warm": False, "ratio": short / base, "now_bps": short * k, "typ_bps": base * k,
+            "range_bps": (hi - lo) / price * 10000.0, "price": price}
+
+
+def vol_update(symbol: str):
+    global _vol_seq
+    st = vol_state[symbol]
+    now = time.time()
+    m = vol_measure(symbol)
+    if m is None or m.get("warm"):
+        st.update(warm=True, ratio=None, level=0, now_bps=None, typ_bps=None, range_bps=None)
+        return
+    ratio, price = m["ratio"], m["price"]
+    st.update(warm=False, ratio=round(ratio, 2), level=_vol_level(ratio), now_bps=round(m["now_bps"], 2),
+              typ_bps=round(m["typ_bps"], 2), range_bps=round(m["range_bps"], 2))
+    coin = symbol.replace("USDT", "")
+    if not st["active"]:
+        if ratio >= VOL_ON:
+            if st["first_above"] is None:
+                st["first_above"] = (now, price)
+            elif now - st["first_above"][0] >= VOL_START_HOLD:
+                _vol_seq += 1
+                t0, p0 = st["first_above"]
+                ev = {"id": _vol_seq, "symbol": coin, "start": int(t0), "end": None, "active": True,
+                      "peak_ratio": round(ratio, 2), "peak_level": _vol_level(ratio),
+                      "start_price": p0, "last_price": price, "hi": max(p0, price), "lo": min(p0, price)}
+                st.update(active=True, event=ev, below_since=None)
+                vol_events.insert(0, ev)
+                del vol_events[60:]
+                logger.info(f"VOLATILITY START {coin} x{ratio:.1f}")
+        else:
+            st["first_above"] = None
+        return
+    ev = st["event"]
+    ev["last_price"] = price
+    ev["hi"], ev["lo"] = max(ev["hi"], price), min(ev["lo"], price)
+    if ratio > ev["peak_ratio"]:
+        ev["peak_ratio"], ev["peak_level"] = round(ratio, 2), _vol_level(ratio)
+    if ratio < VOL_OFF:
+        if st["below_since"] is None:
+            st["below_since"] = (now, price)
+        elif now - st["below_since"][0] >= VOL_END_HOLD:
+            ev["end"], ev["last_price"], ev["active"] = int(st["below_since"][0]), st["below_since"][1], False
+            st.update(active=False, event=None, first_above=None, below_since=None)
+            logger.info(f"VOLATILITY END {coin} peak x{ev['peak_ratio']}")
+    else:
+        st["below_since"] = None
+
+
+def _vol_event_view(ev: dict) -> dict:
+    p0 = ev["start_price"] or 1.0
+    end = ev["end"] or int(time.time())
+    return {"id": ev["id"], "symbol": ev["symbol"], "start": ev["start"], "end": ev["end"], "active": ev["active"],
+            "dur": max(0, end - ev["start"]), "peak_ratio": ev["peak_ratio"], "peak_level": ev["peak_level"],
+            "move_bps": round((ev["last_price"] - p0) / p0 * 10000.0, 1),
+            "range_bps": round((ev["hi"] - ev["lo"]) / p0 * 10000.0, 1)}
+
+
+def _vol_payload() -> dict:
+    coins = {}
+    for sym, st in vol_state.items():
+        ev = st["event"] if st["active"] else None
+        coins[sym.replace("USDT", "")] = {
+            "warm": st["warm"], "ratio": st["ratio"], "level": st["level"], "label": VOL_LEVELS[st["level"]],
+            "active": st["active"], "since": ev["start"] if ev else None,
+            "peak_ratio": ev["peak_ratio"] if ev else None, "peak_label": VOL_LEVELS[ev["peak_level"]] if ev else None,
+            "now_bps": st["now_bps"], "typ_bps": st["typ_bps"], "range_bps": st["range_bps"],
+        }
+    return {"short_sec": int(VOL_SHORT_SEC), "on": VOL_ON, "off": VOL_OFF, "high": VOL_HIGH, "extreme": VOL_EXTREME,
+            "coins": coins, "events": [_vol_event_view(e) for e in vol_events[:30]]}
 
 
 # ====================== RTDS Chainlink ======================
@@ -1262,9 +1480,15 @@ async def rtds_loop():
         await asyncio.sleep(2)
 
 
-async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int, window_start: datetime) -> bool:
-    """One tick for one coin. Returns False if there is no fresh Chainlink price (coin paused)."""
-    ws = state[symbol]
+async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int, window_start: datetime,
+                         tf: Optional[TF] = None) -> bool:
+    """One tick for one coin. Returns False if there is no fresh Chainlink price (coin paused).
+    tf = timeframe profile (5m by default). Only the 5m profile feeds virtual / live trading and the tick history."""
+    tf = tf or TF5
+    is5 = tf is TF5
+    signal_history = tf.signal_history
+    early_history = tf.early_history
+    ws = tf.state[symbol]
     price = live_chainlink.get(symbol)
     tick = live_chainlink_ts.get(symbol)
     if price is None or tick is None or time.monotonic() - tick > CL_FRESH_SEC:
@@ -1276,13 +1500,14 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     if (ws.window_start is not None and ws.window_start != window_start
             and ws.last_signal and ws.price_to_beat and ws.last_price):
         prev_start_unix = int(ws.window_start.timestamp())
-        final = await fetch_polymarket_close(client, symbol, prev_start_unix)
+        final = await fetch_polymarket_close(client, symbol, prev_start_unix, tf)
         if final is None:
-            final = twap_final_minute(ws.series) or ws.last_price
+            final = twap_final_minute(ws.series, tf.seconds) or ws.last_price
         open_p = ws.price_to_beat
         actual = "UP" if final >= open_p else "DOWN"
         predicted = ws.last_signal.get("side")
-        paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
+        if is5:
+            paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
         for h in signal_history:
             if h.get("window_start") == ws.window_start.isoformat() and h.get("symbol") == symbol.replace("USDT", ""):
                 h["result"] = "win" if predicted == actual else "loss"
@@ -1294,9 +1519,9 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     if (ws.window_start is not None and ws.window_start != window_start
             and ws.early and ws.early.get("side") and ws.price_to_beat and ws.last_price):
         try:
-            fin = await fetch_polymarket_close(client, symbol, int(ws.window_start.timestamp()))
+            fin = await fetch_polymarket_close(client, symbol, int(ws.window_start.timestamp()), tf)
             if fin is None:
-                fin = twap_final_minute(ws.series) or ws.last_price
+                fin = twap_final_minute(ws.series, tf.seconds) or ws.last_price
             act = "UP" if fin >= ws.price_to_beat else "DOWN"
             early_history.insert(0, {
                 "symbol": symbol.replace("USDT", ""), "side": ws.early["side"], "actual": act,
@@ -1310,24 +1535,25 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     # calibration: samples of the finished window get their real result in the background
     if ws.window_start is not None and ws.window_start != window_start and ws.calib_pending:
         pending, ws.calib_pending = ws.calib_pending, []
-        spawn(calib_settle(client, symbol, int(ws.window_start.timestamp()), pending, ws.price_to_beat))
+        spawn(calib_settle(client, symbol, int(ws.window_start.timestamp()), pending, ws.price_to_beat, tf))
 
     # new window
     if ws.window_start is None or ws.window_start != window_start:
-        await paper_settle_orphans(client, symbol, start_unix)
-        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
+        if is5:
+            await paper_settle_orphans(client, symbol, start_unix)
+        pm_open = await fetch_polymarket_open(client, symbol, start_unix, tf)
         if pm_open is not None:
             open_px, open_src = pm_open, "polymarket"
         else:
             open_px, open_src = live_chainlink.get(symbol, price), "chainlink"
         ws.reset(open_px, window_start, source=open_src)
         ws.open_confirmed = pm_open is not None
-        logger.info(f"[{symbol}] New window open={open_px:.4f} ({open_src})")
+        logger.info(f"[{symbol}/{tf.key}] New window open={open_px:.4f} ({open_src})")
         return True
 
     # Polymarket open not available at window start yet -> keep retrying
     if not ws.open_confirmed:
-        pm_open = await fetch_polymarket_open(client, symbol, start_unix)
+        pm_open = await fetch_polymarket_open(client, symbol, start_unix, tf)
         if pm_open is not None:
             ws.price_to_beat = pm_open
             ws.open_confirmed = True
@@ -1337,18 +1563,20 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     # network calls above may have taken a while: re-read time and price
     now_utc = datetime.now(timezone.utc)
     seconds_passed = int((now_utc - window_start).total_seconds())
-    if seconds_passed >= WINDOW_SECONDS:
+    if seconds_passed >= tf.seconds:
         return True        # window just ended; the next tick will open the new one
     price = live_chainlink.get(symbol, price)
 
     # update live
     ws.prices.append(price)
     ws.last_price = price
-    tick_hist[symbol].append((time.time(), price))
+    if is5:            # one shared tick history: only the 5m loop writes it (otherwise ticks would be doubled)
+        tick_hist[symbol].append((time.time(), price))
+        vol_update(symbol)
 
     # calibration checkpoints (only with the confirmed Polymarket open, only the first tick right after the checkpoint)
     if ws.open_confirmed and ws.price_to_beat:
-        for cp in CALIB_CPS:
+        for cp in tf.cps:
             if cp in ws.calib_done or seconds_passed < cp:
                 continue
             ws.calib_done.add(cp)
@@ -1361,7 +1589,7 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
                       "side": "UP" if lead_c > 0 else "DOWN", "mom": round(momentum_bps(ws.prices, 12), 2),
                       "ts": int(time.time()), "ask": None}
             ws.calib_pending.append(sample)
-            spawn(calib_fill_ask(client, symbol, start_unix, sample))
+            spawn(calib_fill_ask(client, symbol, start_unix, sample, tf))
 
     # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
     if ws.early is None and seconds_passed >= 3:
@@ -1379,12 +1607,12 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
     if ws.signal_sent:
         return True
     signal, mode = None, "confirm"
-    if seconds_passed >= CONFIRM_AT:
-        signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices)
+    if seconds_passed >= tf.confirm_at:
+        signal = generate_signal(ws.price_to_beat, price, seconds_passed, ws.prices, tf)
         if not is_strong_signal(signal):
             signal = None
-    elif EARLY_ON and seconds_passed >= EARLY_FROM:
-        signal, mode = early_signal(symbol, ws, price, seconds_passed), "early"
+    elif EARLY_ON and seconds_passed >= tf.early_from:
+        signal, mode = early_signal(symbol, ws, price, seconds_passed, tf), "early"
     if signal:
         ws.signal_sent = True
         entry = {
@@ -1398,33 +1626,35 @@ async def process_symbol(client: httpx.AsyncClient, symbol: str, start_unix: int
             "time": now_utc.isoformat(),
             "window_start": window_start.isoformat(),
         }
-        p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series)
+        p_up = model_prob_up(ws.price_to_beat, price, seconds_passed, ws.series, tf.seconds)
         p_side = None if p_up is None else (p_up if signal["side"] == "UP" else 1.0 - p_up)
         entry["model_p"] = round(p_side, 3) if p_side is not None else None
         ws.last_signal = entry
         signal_history.insert(0, entry)
-        spawn(paper_open(client, symbol, signal["side"], start_unix, p_side, mode))
-        spawn(_attach_mkt_price(client, entry, symbol.replace("USDT", ""), signal["side"], start_unix))
-        if len(signal_history) > 50:
-            signal_history.pop()
+        if is5:            # virtual wallets (and live, via wallet 1) trade only 5m signals
+            spawn(paper_open(client, symbol, signal["side"], start_unix, p_side, mode))
+        spawn(_attach_mkt_price(client, entry, symbol.replace("USDT", ""), signal["side"], start_unix, tf))
+        if len(signal_history) > HISTORY_KEEP:
+            del signal_history[HISTORY_KEEP:]
         logger.info(
-            f"SIGNAL[{mode}@{seconds_passed}s] {symbol} {signal['side']} conf={signal['confidence']} "
+            f"SIGNAL[{tf.key}/{mode}@{seconds_passed}s] {symbol} {signal['side']} conf={signal['confidence']} "
             f"score={signal.get('score')} lead={signal.get('lead_bps')} "
             f"mom={signal.get('mom_short')}"
         )
     return True
 
 
-async def price_loop():
-    global global_error
+async def price_loop(tf: Optional[TF] = None):
+    """One loop per timeframe, each with its own HTTP client: a problem in the 15m loop cannot slow down the 5m one."""
+    tf = tf or TF5
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
         while True:
             try:
-                start_unix = get_window_start_unix()
-                window_start = get_current_window_start()
+                start_unix = get_window_start_unix(tf)
+                window_start = get_current_window_start(tf)
                 # all coins in parallel: a slow Polymarket call for one coin must not delay the others
                 results = await asyncio.wait_for(
-                    asyncio.gather(*(process_symbol(client, s, start_unix, window_start) for s in SYMBOLS),
+                    asyncio.gather(*(process_symbol(client, s, start_unix, window_start, tf) for s in SYMBOLS),
                                    return_exceptions=True),
                     timeout=20.0,
                 )
@@ -1434,13 +1664,13 @@ async def price_loop():
                         logger.error(f"process {s}: {r!r}")
                     elif r:
                         any_ok = True
-                global_error = None if any_ok else "Chainlink: немає свіжих цін"
+                tf.error = None if any_ok else "Chainlink: немає свіжих цін"
                 await asyncio.sleep(1.5)      # keep 1.5s: momentum thresholds are tuned for this tick spacing
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                global_error = str(e) or type(e).__name__
-                logger.error(f"Loop: {global_error}")
+                tf.error = str(e) or type(e).__name__
+                logger.error(f"Loop[{tf.key}]: {tf.error}")
                 await asyncio.sleep(5)
 
 
@@ -1489,19 +1719,22 @@ def _flip_info(symbol: str, ws, current: float, lead_bps: float, time_left: int)
 
 
 async def api_status(request):
-    window_start = get_current_window_start()
+    tf = _tf_from(request)                     # ?tf=15m -> 15-minute forecasts, default 5m
+    signal_history = tf.signal_history
+    early_history = tf.early_history
+    window_start = get_current_window_start(tf)
     seconds_passed = int((datetime.now(timezone.utc) - window_start).total_seconds())
-    time_left = max(0, WINDOW_SECONDS - seconds_passed)
+    time_left = max(0, tf.seconds - seconds_passed)
 
     markets = {}
-    for symbol, ws in state.items():
+    for symbol, ws in tf.state.items():
         name = symbol.replace("USDT", "")
         if ws.price_to_beat is None:
             markets[name] = {"status": "waiting", "error": ws.last_error}
             continue
         current = ws.last_price or ws.price_to_beat
         lead = ((current - ws.price_to_beat) / ws.price_to_beat) * 10000
-        live = generate_signal(ws.price_to_beat, current, max(seconds_passed, CONFIRM_AT), ws.prices)
+        live = generate_signal(ws.price_to_beat, current, max(seconds_passed, tf.confirm_at), ws.prices, tf)
         markets[name] = {
             "open": round(ws.price_to_beat, 4),
             "current": round(current, 4),
@@ -1513,7 +1746,7 @@ async def api_status(request):
             "live_score": live.get("score", 0),
             "live_reason": live.get("reason"),
             "early": ws.early,
-            "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series)),
+            "model_p_up": (lambda p: round(p, 3) if p is not None else None)(model_prob_up(ws.price_to_beat, current, seconds_passed, ws.series, tf.seconds)),
             "source": ws.source,
             "flip": _flip_info(symbol, ws, current, lead, time_left),
             "stale": bool(ws.last_error),
@@ -1530,9 +1763,10 @@ async def api_status(request):
     win_rate = round(wins / total_r * 100, 1) if total_r else None
 
     timing = []
-    for label, lo, hi in (("ранні (до %d с)" % CONFIRM_AT, 0, CONFIRM_AT), ("%d–200 с" % CONFIRM_AT, CONFIRM_AT, 200), ("після 200 с", 200, 10**6)):
-        grp = [h for h in resolved if lo <= h.get("fired_at", CONFIRM_AT) < hi]
-        px = [h["mkt_price"] for h in signal_history if h.get("mkt_price") is not None and lo <= h.get("fired_at", CONFIRM_AT) < hi]
+    mid = int(round(tf.seconds * 2 / 3))      # 200 s for 5m (as before), 600 s for 15m
+    for label, lo, hi in (("ранні (до %d с)" % tf.confirm_at, 0, tf.confirm_at), ("%d–%d с" % (tf.confirm_at, mid), tf.confirm_at, mid), ("після %d с" % mid, mid, 10**6)):
+        grp = [h for h in resolved if lo <= h.get("fired_at", tf.confirm_at) < hi]
+        px = [h["mkt_price"] for h in signal_history if h.get("mkt_price") is not None and lo <= h.get("fired_at", tf.confirm_at) < hi]
         if grp or px:
             timing.append({"label": label, "n": len(grp), "wins": sum(1 for h in grp if h["result"] == "win"),
                            "avg_mkt": round(sum(px) / len(px), 3) if px else None})
@@ -1543,11 +1777,14 @@ async def api_status(request):
         "window_start": window_start.isoformat(),
         "seconds_passed": seconds_passed,
         "time_left": time_left,
-        "confirm_at": CONFIRM_AT,
-        "error": global_error,
+        "confirm_at": tf.confirm_at,
+        "tf": tf.key,
+        "window": tf.seconds,
+        "error": tf.error,
+        "vol": _vol_payload(),
         "chainlink_live": {k.replace("USDT",""): v for k,v in live_chainlink.items()},
         "markets": markets,
-        "history": signal_history[:30],
+        "history": signal_history[:HISTORY_KEEP],
         "early_stats": {
             "wins": sum(1 for e in early_history if e["result"] == "win"),
             "losses": sum(1 for e in early_history if e["result"] == "loss"),
@@ -1567,6 +1804,8 @@ async def health(request):
     return JSONResponse({"ok": True, "chainlink": list(live_chainlink.keys()),
                          "paused": [s.replace("USDT", "") for s, w in state.items() if w.last_error],
                          "rtds": diag,
+                         "tf15": {"on": ENABLE_15M, "confirm_at": CONFIRM_AT_15, "early_from": EARLY_FROM_15,
+                                  "error": TF15.error, "paused": [s.replace("USDT", "") for s, w in TF15.state.items() if w.last_error]},
                          "thresholds": {"min_lead_bps": MIN_LEAD_BPS, "min_mom_short": MIN_MOM_SHORT,
                                         "min_mom_med": MIN_MOM_MED, "confirm_at": CONFIRM_AT, "min_confidence": MIN_CONFIDENCE,
                                         "early": {"on": EARLY_ON, "from": EARLY_FROM, "min_lead_bps": EARLY_MIN_LEAD_BPS,
@@ -1651,32 +1890,7 @@ h1{font-size:1.15rem;font-weight:700}
   <h1>⚡ 5m Signals</h1>
   <div id="badge" class="badge">…</div>
 </header>
-<div class="top" id="top"></div>
-<div class="panel">
-  <div class="pt"><span>Ринки</span><span id="tmr"></span></div>
-  <div class="mrow h"><div>Актив</div><div>Open</div><div>Now</div><div>Сигнал</div></div>
-  <div id="mkt"></div>
-</div>
-<div class="panel">
-  <div class="pt"><span>Графік 5m (Chainlink / Polymarket)</span><span id="cwin"></span></div>
-  <div class="ctabs" id="ctabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
-  <div class="ctabs" id="cmode"><button data-m="c">Свічки 1хв</button><button data-m="l">Лінія</button></div>
-  <div class="cnums"><div><small>Price to beat</small><b id="cpb">—</b></div><div><small>Поточна ціна</small><b id="cpn">—</b></div><div><small>TWAP 60с</small><b id="ctw">—</b></div></div>
-  <div id="chart"></div>
-</div>
-<div class="panel">
-  <div class="pt"><span>Історія</span><span id="st"></span></div>
-  <div class="stats" id="stats"></div>
-  <div class="hrow" style="color:var(--muted);font-size:.65rem"><div>Час</div><div>Акт</div><div>Стор</div><div>Conf</div><div>Lead</div></div>
-  <div id="timing" style="font-size:.74rem;color:var(--muted);line-height:1.5;margin:6px 0 8px"></div>
-  <div id="hist"></div>
-</div>
-<div class="panel">
-  <div class="pt"><span>Де є реальна перевага</span><span id="calN"></span></div>
-  <div class="ctabs" id="calThr"><button data-t="0">всі</button><button data-t="3">≥3 bps</button><button data-t="6">≥6 bps</button><button data-t="10">≥10 bps</button></div>
-  <div id="calBody" style="font-size:.78rem"></div>
-  <div style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px">Рядок = секунда вікна. <b>WR</b> = як часто сторона, що вела на той момент, справді виграла вікно. <b>Ціна</b> = середня ціна покупки цієї сторони на Polymarket. <b>PnL</b> = середній реальний результат однієї акції після комісії (у центах). Це підрахунок записаних фактів, не прогноз. Надійно, коли в рядку ≥30 випадків.</div>
-</div>
+<!--P5-->
 <div style="height:90px"></div>
 <div class="sheet" id="sheet">
   <h3>Угоди на Polymarket (поточне вікно)</h3>
@@ -1690,11 +1904,18 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="ctabs" id="ttabs" style="margin-top:4px"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
   <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
 </div>
+<div class="sheet" id="v15">
+  <h3>Прогнози на 15 хв</h3>
+  <div class="scroll"><!--P15-->
+<div style="height:30px"></div></div>
+</div>
 <div class="sheet" id="vpap">
-  <h3>Віртуальна торгівля та live</h3>
+  <h3>Віртуальні гаманці та live</h3>
   <div class="scroll">
+    <div class="ctabs" id="pwtabs"></div>
     <div class="panel" id="lpan" style="border:1px solid #7f1d1d"></div>
     <div class="panel">
+      <div class="prow"><label>Назва</label><input class="inp" id="pname" maxlength="24" type="text"></div>
       <div class="prow" style="justify-content:space-between"><span>Торгувати віртуально</span><button class="pbtn" id="pen">ВИМК</button></div>
       <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Монети, якими торгувати:</div>
       <div class="ctabs" id="pcoins"><button data-c="BTC">BTC</button><button data-c="ETH">ETH</button><button data-c="SOL">SOL</button><button data-c="XRP">XRP</button></div>
@@ -1715,27 +1936,35 @@ h1{font-size:1.15rem;font-weight:700}
   <div id="tvbox" style="flex:1;min-height:0;margin-bottom:8px;border-radius:12px;overflow:hidden;background:#0b0b0c"></div>
   <div style="font-size:.68rem;color:var(--muted);margin-bottom:8px">TradingView · Bitstamp, 5 хв. Це не Chainlink: ціна може відрізнятись на кілька bps від тієї, за якою рахується Polymarket.</div>
 </div>
-<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
+<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv6">⏱️<span>15 хв</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button><button id="nv5">📊<span>Графік</span></button></nav>
 <script>
 const S=["BTC","ETH","SOL","XRP"];
 function f(n,d=2){return n==null?"—":Number(n).toFixed(d)}
-function drawChart(d){
-  window._d=d;
-  const n=window._cs||"BTC",mode=window._cm||"c";
-  document.querySelectorAll("#ctabs button").forEach(b=>{b.className=b.dataset.s===n?"on":""});
-  document.querySelectorAll("#cmode button").forEach(b=>{b.className=b.dataset.m===mode?"on":""});
-  const box=document.getElementById("chart");
+// two views share the same code: "" = 5m (main page), "15" = 15m sheet. Element ids carry the suffix.
+const VS={"":{cs:"BTC",cm:"c",d:null,thr:"6",tf:"5m"},"15":{cs:"BTC",cm:"c",d:null,thr:"6",tf:"15m"}};
+const E=(id,sx)=>document.getElementById(id+sx);
+const escH=x=>String(x).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const hms=ts=>new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+const fdur=s=>{s=Math.max(0,Math.round(s));const m=Math.floor(s/60);return m?m+"хв "+(s%60)+"с":s+"с"};
+const VCOL=["var(--up)","#eab308","#f97316","var(--down)"];
+function drawChart(d,sx){
+  const V=VS[sx];V.d=d;
+  const n=V.cs,mode=V.cm;
+  document.querySelectorAll("#ctabs"+sx+" button").forEach(b=>{b.className=b.dataset.s===n?"on":""});
+  document.querySelectorAll("#cmode"+sx+" button").forEach(b=>{b.className=b.dataset.m===mode?"on":""});
+  const box=E("chart",sx);
   const m=d.markets[n];
   if(!m||!m.series||m.series.length<2){box.innerHTML="<div style='color:var(--muted);font-size:.85rem'>Збираю дані…</div>";return}
+  const WS=d.window||300,NC=Math.round(WS/60);
   const dec=n==="XRP"?4:2,ser=m.series,open=m.open,last=ser[ser.length-1][1];
-  document.getElementById("cpb").textContent="$"+f(open,dec);
-  const pn=document.getElementById("cpn");pn.textContent="$"+f(last,dec);pn.style.color=last>=open?"var(--up)":"var(--down)";
-  const tw=document.getElementById("ctw");if(m.twap60!=null){tw.textContent="$"+f(m.twap60,dec);tw.style.color=m.twap60>=open?"var(--up)":"var(--down)"}else{tw.textContent="—"}
-  document.getElementById("cwin").textContent=(d.time_left||0)+"s left";
+  E("cpb",sx).textContent="$"+f(open,dec);
+  const pn=E("cpn",sx);pn.textContent="$"+f(last,dec);pn.style.color=last>=open?"var(--up)":"var(--down)";
+  const tw=E("ctw",sx);if(m.twap60!=null){tw.textContent="$"+f(m.twap60,dec);tw.style.color=m.twap60>=open?"var(--up)":"var(--down)"}else{tw.textContent="—"}
+  E("cwin",sx).textContent=(d.time_left||0)+"s left";
   // 1-minute candles
   const cd=[];
   for(const p of ser){
-    const k=Math.min(4,Math.floor(p[0]/60));
+    const k=Math.min(NC-1,Math.floor(p[0]/60));
     if(!cd[k])cd[k]={o:p[1],h:p[1],l:p[1],c:p[1]};
     else{const c=cd[k];c.h=Math.max(c.h,p[1]);c.l=Math.min(c.l,p[1]);c.c=p[1]}
   }
@@ -1743,26 +1972,26 @@ function drawChart(d){
   let lo=Math.min(open,...vals),hi=Math.max(open,...vals);
   let pad=(hi-lo)*0.2;if(!pad)pad=hi*0.0005;lo-=pad;hi+=pad;
   const W=340,H=200,L=4,R=60,T=10,B=20,PW=W-L-R;
-  const X=t=>L+Math.min(t,300)/300*PW,Y=p=>T+(hi-p)/(hi-lo)*(H-T-B);
+  const X=t=>L+Math.min(t,WS)/WS*PW,Y=p=>T+(hi-p)/(hi-lo)*(H-T-B);
   let g="";
   for(let i=0;i<4;i++){
     const p=hi-(hi-lo)*i/3,y=Y(p);
     g+="<line x1='"+L+"' x2='"+(W-R)+"' y1='"+y+"' y2='"+y+"' stroke='#232326' stroke-width='1'/><text x='"+(W-R+4)+"' y='"+(y+3)+"' fill='#8a8a93' font-size='9'>"+f(p,dec)+"</text>";
   }
-  for(let i=1;i<5;i++){const x=L+PW*i/5;g+="<line x1='"+x+"' x2='"+x+"' y1='"+T+"' y2='"+(H-B)+"' stroke='#1a1a1d' stroke-width='1'/>"}
+  for(let i=1;i<NC;i++){const xx=L+PW*i/NC;g+="<line x1='"+xx+"' x2='"+xx+"' y1='"+T+"' y2='"+(H-B)+"' stroke='#1a1a1d' stroke-width='1'/>"}
   const yo=Y(open),xc=X(d.confirm_at||0);
   g+="<line x1='"+L+"' x2='"+(W-R)+"' y1='"+yo+"' y2='"+yo+"' stroke='#8a8a93' stroke-width='1' stroke-dasharray='4 3'/>";
   g+="<text x='"+(W-R+4)+"' y='"+(yo-4)+"' fill='#e8e8ea' font-size='9'>open</text>";
   g+="<line x1='"+xc+"' x2='"+xc+"' y1='"+T+"' y2='"+(H-B)+"' stroke='#8b8bff' stroke-width='1' stroke-dasharray='2 3'/>";
   g+="<text x='"+(xc+3)+"' y='"+(H-B-4)+"' fill='#8b8bff' font-size='9'>conf</text>";
   if(mode==="c"){
-    const cw=PW/5*0.6;
+    const cw=PW/NC*0.6;
     cd.forEach((c,i)=>{
       if(!c)return;
-      const col=c.c>=c.o?"#22c55e":"#ef4444",x=L+PW*(i+0.5)/5;
+      const col=c.c>=c.o?"#22c55e":"#ef4444",xx=L+PW*(i+0.5)/NC;
       const yt=Math.min(Y(c.o),Y(c.c)),hh=Math.max(1.5,Math.abs(Y(c.o)-Y(c.c)));
-      g+="<line x1='"+x+"' x2='"+x+"' y1='"+Y(c.h)+"' y2='"+Y(c.l)+"' stroke='"+col+"' stroke-width='1.5'/>";
-      g+="<rect x='"+(x-cw/2)+"' y='"+yt+"' width='"+cw+"' height='"+hh+"' fill='"+col+"' rx='1'/>";
+      g+="<line x1='"+xx+"' x2='"+xx+"' y1='"+Y(c.h)+"' y2='"+Y(c.l)+"' stroke='"+col+"' stroke-width='1.5'/>";
+      g+="<rect x='"+(xx-cw/2)+"' y='"+yt+"' width='"+cw+"' height='"+hh+"' fill='"+col+"' rx='1'/>";
     });
   }else{
     const col=last>=open?"#22c55e":"#ef4444";
@@ -1771,17 +2000,50 @@ function drawChart(d){
     g+="<path d='"+path+"' fill='none' stroke='"+col+"' stroke-width='2' stroke-linejoin='round'/>";
     g+="<circle cx='"+X(ser[ser.length-1][0])+"' cy='"+Y(last)+"' r='3.5' fill='"+col+"'/>";
   }
-  for(let i=0;i<=5;i++){const x=L+PW*i/5;g+="<text x='"+(x-(i?8:0))+"' y='"+(H-4)+"' fill='#8a8a93' font-size='9'>"+i+":00</text>"}
+  const step=NC>5?3:1;
+  for(let i=0;i<=NC;i+=step){const xx=L+PW*i/NC;g+="<text x='"+(xx-(i?8:0))+"' y='"+(H-4)+"' fill='#8a8a93' font-size='9'>"+i+":00</text>"}
   box.innerHTML="<svg viewBox='0 0 "+W+" "+H+"' width='100%' style='display:block'>"+g+"</svg>";
 }
-document.getElementById("ctabs").onclick=function(e){const s=e.target.dataset&&e.target.dataset.s;if(s){window._cs=s;if(window._d)drawChart(window._d)}};
-document.getElementById("cmode").onclick=function(e){const s=e.target.dataset&&e.target.dataset.m;if(s){window._cm=s;if(window._d)drawChart(window._d)}};
-function render(d){
-  drawChart(d);
-  const badge=document.getElementById("badge");
-  if(d.error){badge.textContent=d.error;badge.className="badge"}
-  else{badge.textContent="live · "+(d.seconds_passed||0)+"s";badge.className="badge ok"}
-  document.getElementById("tmr").textContent=(d.time_left||0)+"s left · conf@"+d.confirm_at+"s";
+function drawVol(d,sx){
+  const v=d.vol;if(!v)return;
+  const now=Math.floor(new Date(d.server_time).getTime()/1000);
+  let h="",nAct=0;
+  for(const n of S){
+    const c=v.coins[n];if(!c)continue;
+    let st,sub="";
+    if(c.warm){
+      st="<span class='bs bw'>збираю дані</span>";
+      sub="потрібно ~10 хв історії тіків, щоб знати, що для цієї монети «норма»";
+    }else{
+      const col=VCOL[c.level];
+      st="<span class='bs' style='background:rgba(255,255,255,.06);color:"+col+"'>"+(c.level?"⚡ ":"")+escH(c.label)+" ×"+f(c.ratio,1)+"</span>";
+      sub="зараз "+f(c.now_bps,1)+" bps за "+v.short_sec+" с · норма "+f(c.typ_bps,1)+" · розмах "+f(c.range_bps,1);
+      if(c.active&&c.since){
+        nAct++;
+        sub="<b style='color:"+VCOL[Math.max(1,c.level)]+"'>Триває з "+hms(c.since)+" ("+fdur(now-c.since)+"), пік ×"+f(c.peak_ratio,1)+" ("+escH(c.peak_label)+")</b><br>"+sub;
+      }
+    }
+    h+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><b>"+n+"</b>"+st+"</div><div class='sub'>"+sub+"</div></div>";
+  }
+  E("vol",sx).innerHTML=h;
+  E("volt",sx).textContent=nAct?("⚡ зараз: "+nAct):"спокійно";
+  let eh="";
+  for(const e of (v.events||[]).slice(0,10)){
+    const col=VCOL[Math.max(1,e.peak_level)];
+    eh+="<div class='wrow' style='padding:6px 0'><b>"+escH(e.symbol)+"</b> · "+hms(e.start)+" → "+(e.active?"<b style='color:"+col+"'>триває</b>":hms(e.end))+" ("+fdur(e.dur)+") · <span style='color:"+col+"'>пік ×"+f(e.peak_ratio,1)+"</span><div class='sub'>розмах "+f(e.range_bps,1)+" bps · рух від старту "+(e.move_bps>=0?"+":"")+f(e.move_bps,1)+" bps</div></div>";
+  }
+  E("volh",sx).innerHTML=eh||"<div style='color:var(--muted)'>Поки не було</div>";
+  E("volnote",sx).innerHTML="<b>×N</b> = наскільки різкіше ціна рухається за останні "+v.short_sec+" с порівняно зі звичайним рівнем цієї монети (медіана за останню годину; ×1 = норма). Період починається, коли ≥×"+v.on+" тримається кілька секунд, і закінчується, коли &lt;×"+v.off+" тримається ~30 с. Рівні: помірна ≥×"+v.on+", висока ≥×"+v.high+", екстремальна ≥×"+v.extreme+". Під час такої волатильності ціна ринку може швидко йти до крайніх значень і розвертатись. Це лише індикація: на сигнали та угоди вона не впливає.";
+}
+function render(d,sx){
+  drawChart(d,sx);
+  drawVol(d,sx);
+  if(sx===""){
+    const badge=document.getElementById("badge");
+    if(d.error){badge.textContent=d.error;badge.className="badge"}
+    else{badge.textContent="live · "+(d.seconds_passed||0)+"s";badge.className="badge ok"}
+  }
+  E("tmr",sx).textContent=(d.time_left||0)+"s left · conf@"+d.confirm_at+"s"+(sx&&d.error?" · "+d.error:"");
   let top="";
   for(const n of S){
     const m=d.markets[n];
@@ -1789,8 +2051,9 @@ function render(d){
     const c=m.lead_bps>=0?"pos":"neg";
     top+=`<div class="ac"><div class="an">${n} · ${m.source||""}</div><div class="ap">$${f(m.current,n==="XRP"?4:2)}</div><div class="ach ${c}">${m.lead_bps>=0?"+":""}${m.lead_bps} bps</div></div>`;
   }
-  document.getElementById("top").innerHTML=top;
+  E("top",sx).innerHTML=top;
   let body="",anyFlip=false;
+  const now=Math.floor(new Date(d.server_time).getTime()/1000);
   for(const n of S){
     const m=d.markets[n];
     if(!m||m.status==="waiting"){body+=`<div class="mrow"><div>${n}</div><div>—</div><div>—</div><div class="bs bw">…</div></div>`;continue}
@@ -1811,6 +2074,10 @@ function render(d){
       sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
     body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
+    const vc=d.vol&&d.vol.coins&&d.vol.coins[n];
+    if(vc&&vc.active&&vc.since){
+      body+=`<div style="font-size:.74rem;line-height:1.4;margin:-2px 0 8px;padding:0 4px;color:${VCOL[Math.max(1,vc.level)]}">⚡ ${n}: ${escH(vc.label)} волатильність ×${f(vc.ratio,1)} · з ${hms(vc.since)} (${fdur(now-vc.since)}). Ціна може різко розвернутись.</div>`;
+    }
     const fl=m.flip;
     if(fl&&!m.stale){
       const dir=fl.leader==="UP"?"ВНИЗ":"ВГОРУ",dec=n==="XRP"?4:2;
@@ -1829,13 +2096,13 @@ function render(d){
   if(anyFlip)body+=`<div style="font-size:.68rem;color:var(--muted);margin-top:4px">Це підрахунок фактичних тіків Chainlink, які записав бот, а не прогноз: розворот можливий, поки вікно не закрилось.</div>`;
   const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
   body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз (одразу на старті вікна, низька впевненість, окрема статистика): <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}</div>`;
-  document.getElementById("mkt").innerHTML=body;
+  E("mkt",sx).innerHTML=body;
   const st=d.stats||{};
   if(st.win_rate!=null){
-    document.getElementById("stats").innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`;
+    E("stats",sx).innerHTML=`<span>Сигналів: <b>${st.signals||0}</b></span><span>Вирішено: <b>${st.resolved||0}</b></span><span>Win: <b class="pos">${st.wins||0}</b></span><span>Loss: <b class="neg">${st.losses||0}</b></span><span>WR: <b>${st.win_rate}%</b></span>`;
   }
   const tm=d.timing||[];
-  const tel=document.getElementById("timing");
+  const tel=E("timing",sx);
   if(tel)tel.innerHTML=tm.length?("<b>Коли видано сигнал</b> (останні сигнали): "+tm.map(x=>x.label+": "+(x.n?`<b>${x.wins}/${x.n}</b>`:"—")+(x.avg_mkt!=null?` · ринок ~${Math.round(x.avg_mkt*100)}¢`:"")).join(" · ")):"";
   const h=d.history||[];
   if(h.length){
@@ -1848,28 +2115,36 @@ function render(d){
       const mv=e.move==null?null:e.move;
       x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${e.mode==="early"?"ранній":(e.confidence*100).toFixed(0)+"%"+sc}${e.mkt_price!=null?` <span style="color:var(--muted)">${Math.round(e.mkt_price*100)}¢</span>`:""}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
     }
-    document.getElementById("hist").innerHTML=x;
+    E("hist",sx).innerHTML=x;
   }
 }
-let calThr="6";
-async function loadCal(){
+async function loadCal(sx){
+  sx=sx||"";const V=VS[sx];
   try{
-    const d=await(await fetch("/api/calib")).json();
-    document.querySelectorAll("#calThr button").forEach(b=>{b.className=b.dataset.t===calThr?"on":""});
-    document.getElementById("calN").textContent="записано "+d.total;
-    const rows=(d.rows&&d.rows[calThr])||[];
+    const d=await(await fetch("/api/calib?tf="+V.tf)).json();
+    document.querySelectorAll("#calThr"+sx+" button").forEach(b=>{b.className=b.dataset.t===V.thr?"on":""});
+    E("calN",sx).textContent="записано "+d.total;
+    const rows=(d.rows&&d.rows[V.thr])||[];
     let h="<div style='display:grid;grid-template-columns:.9fr .8fr .9fr .9fr 1fr;gap:4px;color:var(--muted);font-size:.68rem;margin:6px 0 2px'><div>Секунда</div><div>Випадків</div><div>WR</div><div>Ціна</div><div>PnL/акцію</div></div>";
     for(const r of rows){
       const few=r.n<30,col=few?"var(--muted)":"inherit";
       const pc=r.pnl==null?"var(--muted)":(few?"var(--muted)":(r.pnl>0?"var(--up)":"var(--down)"));
       h+="<div style='display:grid;grid-template-columns:.9fr .8fr .9fr .9fr 1fr;gap:4px;padding:3px 0;border-top:1px solid #1f1f22;color:"+col+"'><div>"+r.cp+"с</div><div>"+r.n+"</div><div>"+(r.wr==null?"—":r.wr.toFixed(0)+"%")+"</div><div>"+(r.ask==null?"—":r.ask.toFixed(0)+"¢")+"</div><div style='color:"+pc+"'>"+(r.pnl==null?"—":(r.pnl>0?"+":"")+r.pnl.toFixed(1)+"¢")+"</div></div>";
     }
-    if(!d.total)h+="<div style='color:var(--muted);margin-top:6px'>Збираю дані: перші результати через ~5 хв, надійні висновки після доби роботи.</div>";
-    document.getElementById("calBody").innerHTML=h;
+    if(!d.total)h+="<div style='color:var(--muted);margin-top:6px'>Збираю дані: перші результати через одне вікно, надійні висновки після доби роботи.</div>";
+    E("calBody",sx).innerHTML=h;
   }catch(e){}
 }
-document.getElementById("calThr").onclick=function(e){const t=e.target.dataset&&e.target.dataset.t;if(t!==undefined&&t!==""){calThr=t;loadCal()}};
-async function refresh(){try{render(await(await fetch("/api/status")).json())}catch(e){document.getElementById("badge").textContent="offline"}}
+async function refresh(sx){
+  sx=(typeof sx==="string")?sx:"";
+  try{render(await(await fetch("/api/status?tf="+VS[sx].tf)).json(),sx)}
+  catch(e){if(sx==="")document.getElementById("badge").textContent="offline"}
+}
+for(const sx of ["","15"]){
+  E("ctabs",sx).onclick=function(e){const s=e.target.dataset&&e.target.dataset.s;if(s){VS[sx].cs=s;if(VS[sx].d)drawChart(VS[sx].d,sx)}};
+  E("cmode",sx).onclick=function(e){const s=e.target.dataset&&e.target.dataset.m;if(s){VS[sx].cm=s;if(VS[sx].d)drawChart(VS[sx].d,sx)}};
+  E("calThr",sx).onclick=function(e){const t=e.target.dataset&&e.target.dataset.t;if(t!==undefined&&t!==""){VS[sx].thr=t;loadCal(sx)}};
+}
 (function(){
   let sym='BTC',sub='feed',tper='day',timer=null,data=null;
   const esc=x=>String(x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -1927,7 +2202,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       b.innerHTML=x||'Поки порожньо';
     }catch(e){b.innerHTML='Не вдалося завантажити'}
   }
-  let pinit=false,pen=false,pcoins={},pdepSrv=0;
+  let pinit=false,pen=false,pcoins={},pdepSrv=0,pw=0,ctimer=null;
   const money=x=>(x<0?'-':'')+'$'+Math.abs(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   function drawCfg(){
     const e=document.getElementById('pen');e.textContent=pen?'УВІМК':'ВИМК';e.className='pbtn'+(pen?' on':'');
@@ -1935,6 +2210,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   }
   function fillCfg(c){
     pen=c.enabled;pcoins=Object.assign({},c.coins);pdepSrv=c.deposit;
+    document.getElementById('pname').value=c.name||'';
     document.getElementById('pmode').value=c.stake_mode;
     document.getElementById('pval').value=c.stake_value;
     document.getElementById('pdep').value=c.deposit;
@@ -1977,7 +2253,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       h+="<div style='font-size:.78rem;color:var(--muted);line-height:1.5'>Вимкнено на сервері. Щоб підключити, додай у Render → Environment: <b>"+d.missing.map(esc).join(', ')+"</b></div>";
     }else{
       h+="<div class='prow' style='justify-content:space-between'><span>Реальні ставки</span><button class='pbtn"+(d.armed?" on":"")+"' id='larm'>"+(d.armed?"УВІМК":"ВИМК")+"</button></div>";
-      h+="<div style='font-size:.75rem;color:var(--muted);line-height:1.5'>Акаунт "+esc(d.wallet_short)+" · ставка $"+d.stake+" · ліміт збитку за день $"+d.daily_loss_limit+" · сьогодні "+(d.day_pnl>=0?'+':'')+"$"+d.day_pnl+" (оцінка) · відкрито "+d.open+"/"+d.max_open+"<br>Повторює віртуальні угоди (їхні фільтри теж діють)"+(d.allow_early?", у тому числі за ранніми сигналами":", крім ранніх сигналів")+". Після кожного перезапуску сервера треба вмикати знову.</div>";
+      h+="<div style='font-size:.75rem;color:var(--muted);line-height:1.5'>Акаунт "+esc(d.wallet_short)+" · ставка $"+d.stake+" · ліміт збитку за день $"+d.daily_loss_limit+" · сьогодні "+(d.day_pnl>=0?'+':'')+"$"+d.day_pnl+" (оцінка) · відкрито "+d.open+"/"+d.max_open+"<br>Повторює угоди Гаманця 1 (його фільтри теж діють)"+(d.allow_early?", у тому числі за ранніми сигналами":", крім ранніх сигналів")+". Після кожного перезапуску сервера треба вмикати знову.</div>";
     }
     if(d.disarm_reason&&!d.armed)h+="<div style='font-size:.78rem;color:var(--down);margin-top:6px'>Вимкнено: "+esc(d.disarm_reason)+"</div>";
     if(d.last_error)h+="<div style='font-size:.78rem;color:var(--down);margin-top:6px'>"+esc(d.last_error)+"</div>";
@@ -2009,21 +2285,39 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   async function loadL(){
     try{drawL(await (await fetch('/api/live')).json())}catch(e){}
   }
+  function drawWT(ws){
+    if(!ws)return;
+    let h='';
+    ws.forEach((w,i)=>{
+      const c=w.pnl>=0?'var(--up)':'var(--down)';
+      h+="<button data-w='"+i+"' class='"+(i===pw?'on':'')+"'><span style='color:"+(w.enabled?'var(--up)':'var(--muted)')+"'>●</span> "+esc(w.name)+"<br><small style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+'$'+Math.abs(w.pnl).toFixed(2)+(w.open?' · '+w.open+' відкр.':'')+"</small></button>";
+    });
+    document.getElementById('pwtabs').innerHTML=h;
+  }
   async function loadP(){
-    loadL();
+    document.getElementById('lpan').style.display=pw===0?'':'none';   // real money mirrors wallet 1 only
+    if(pw===0)loadL();
     try{
-      const d=await (await fetch('/api/paper')).json();
+      const d=await (await fetch('/api/paper?w='+pw)).json();
+      if(d.w!==pw)return;
+      drawWT(d.wallets);
       if(!pinit){fillCfg(d.config);pinit=true}
       drawAcc(d);
     }catch(e){}
   }
   async function postP(url,body){
+    body.w=pw;
     const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     return r.json();
   }
+  document.getElementById('pwtabs').onclick=e=>{
+    const b=e.target.closest&&e.target.closest('button');
+    if(b&&b.dataset.w!==undefined){pw=+b.dataset.w;pinit=false;document.getElementById('plist').innerHTML='';document.getElementById('pacc').innerHTML='';loadP()}
+  };
   async function saveCfg(explicit){
     const body={enabled:pen,coins:pcoins};
     if(explicit){
+      body.name=document.getElementById('pname').value;
       body.stake_mode=document.getElementById('pmode').value;
       body.stake_value=parseFloat(document.getElementById('pval').value);
       body.min_edge=parseFloat(document.getElementById('pedge').value)||0;
@@ -2036,7 +2330,9 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       }
     }
     const d=await postP('/api/paper/config',body);
+    if(d.w!==pw)return;
     if(explicit)fillCfg(d.config);else{pdepSrv=d.config.deposit;drawCfg()}
+    drawWT(d.wallets);
     drawAcc(d);
     if(explicit){const m=document.getElementById('pmsg');m.textContent='Збережено ✓';setTimeout(()=>{m.textContent=''},1800)}
   }
@@ -2046,7 +2342,8 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   document.getElementById('preset').onclick=async()=>{
     if(!confirm('Скинути віртуальний рахунок і стерти історію угод?'))return;
     const d=await postP('/api/paper/reset',{deposit:parseFloat(document.getElementById('pdep').value)});
-    fillCfg(d.config);drawAcc(d);
+    if(d.w!==pw)return;
+    fillCfg(d.config);drawWT(d.wallets);drawAcc(d);
   };
   let csym='BTC',cbuilt='';
   const TVS={BTC:'BITSTAMP:BTCUSD',ETH:'BITSTAMP:ETHUSD',SOL:'BITSTAMP:SOLUSD',XRP:'BITSTAMP:XRPUSD'};
@@ -2070,16 +2367,19 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     document.getElementById('vtop').classList.toggle('open',v==='top');
     document.getElementById('vpap').classList.toggle('open',v==='pap');
     document.getElementById('vchart').classList.toggle('open',v==='chart');
+    document.getElementById('v15').classList.toggle('open',v==='t15');
+    document.getElementById('nv6').className=v==='t15'?'on':'';
     document.getElementById('nv1').className=v==='main'?'on':'';
     document.getElementById('nv2').className=v==='wal'?'on':'';
     document.getElementById('nv3').className=v==='top'?'on':'';
     document.getElementById('nv4').className=v==='pap'?'on':'';
     document.getElementById('nv5').className=v==='chart'?'on':'';
-    clearInterval(timer);clearTimeout(ttimer);
+    clearInterval(timer);clearTimeout(ttimer);clearInterval(ctimer);
     if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
     else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
     else if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
     else if(v==='chart'){loadChart()}
+    else if(v==='t15'){refresh('15');loadCal('15');timer=setInterval(()=>refresh('15'),2000);ctimer=setInterval(()=>loadCal('15'),30000)}
     else window.scrollTo(0,0);
   }
   document.getElementById('nv1').onclick=()=>show('main');
@@ -2087,6 +2387,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   document.getElementById('nv3').onclick=()=>show('top');
   document.getElementById('nv4').onclick=()=>show('pap');
   document.getElementById('nv5').onclick=()=>show('chart');
+  document.getElementById('nv6').onclick=()=>show('t15');
   document.getElementById('ktabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){csym=s;loadChart()}};
   document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
   document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
@@ -2099,13 +2400,53 @@ loadCal();setInterval(loadCal,30000);
 </html>"""
 
 
+_PANELS = r"""<div class="top" id="top@@"></div>
+<div class="panel">
+  <div class="pt"><span>⚡ Волатильність</span><span id="volt@@"></span></div>
+  <div id="vol@@"></div>
+  <div class="sec" style="margin:10px 0 2px">Останні періоди</div>
+  <div id="volh@@" style="font-size:.78rem"></div>
+  <div id="volnote@@" style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px"></div>
+</div>
+<div class="panel">
+  <div class="pt"><span>Ринки</span><span id="tmr@@"></span></div>
+  <div class="mrow h"><div>Актив</div><div>Open</div><div>Now</div><div>Сигнал</div></div>
+  <div id="mkt@@"></div>
+</div>
+<div class="panel">
+  <div class="pt"><span>Графік @T@ (Chainlink / Polymarket)</span><span id="cwin@@"></span></div>
+  <div class="ctabs" id="ctabs@@"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
+  <div class="ctabs" id="cmode@@"><button data-m="c">Свічки 1хв</button><button data-m="l">Лінія</button></div>
+  <div class="cnums"><div><small>Price to beat</small><b id="cpb@@">—</b></div><div><small>Поточна ціна</small><b id="cpn@@">—</b></div><div><small>TWAP 60с</small><b id="ctw@@">—</b></div></div>
+  <div id="chart@@"></div>
+</div>
+<div class="panel">
+  <div class="pt"><span>Історія</span><span id="st@@"></span></div>
+  <div class="stats" id="stats@@"></div>
+  <div class="hrow" style="color:var(--muted);font-size:.65rem"><div>Час</div><div>Акт</div><div>Стор</div><div>Conf</div><div>Lead</div></div>
+  <div id="timing@@" style="font-size:.74rem;color:var(--muted);line-height:1.5;margin:6px 0 8px"></div>
+  <div id="hist@@"></div>
+</div>
+<div class="panel">
+  <div class="pt"><span>Де є реальна перевага</span><span id="calN@@"></span></div>
+  <div class="ctabs" id="calThr@@"><button data-t="0">всі</button><button data-t="3">≥3 bps</button><button data-t="6">≥6 bps</button><button data-t="10">≥10 bps</button></div>
+  <div id="calBody@@" style="font-size:.78rem"></div>
+  <div style="font-size:.68rem;color:var(--muted);line-height:1.45;margin-top:8px">Рядок = секунда вікна. <b>WR</b> = як часто сторона, що вела на той момент, справді виграла вікно. <b>Ціна</b> = середня ціна покупки цієї сторони на Polymarket. <b>PnL</b> = середній реальний результат однієї акції після комісії (у центах). Це підрахунок записаних фактів, не прогноз. Надійно, коли в рядку ≥30 випадків.</div>
+</div>
+"""
+HTML_PAGE = (HTML_PAGE.replace("<!--P5-->", _PANELS.replace("@@", "").replace("@T@", "5m"))
+             .replace("<!--P15-->", _PANELS.replace("@@", "15").replace("@T@", "15m")))
+
+
 async def dashboard(request):
     return HTMLResponse(HTML_PAGE)
 
 
 async def on_startup():
     spawn(supervise("rtds", rtds_loop))
-    spawn(supervise("price", price_loop))
+    spawn(supervise("price", lambda: price_loop(TF5)))
+    if ENABLE_15M:
+        spawn(supervise("price15", lambda: price_loop(TF15)))
     spawn(keepalive_loop())
     logger.info("RTDS + price loops started")
 
@@ -2353,36 +2694,53 @@ async def api_top(request):
     return JSONResponse(payload)
 
 
-async def _paper_payload():
-    trades = paper["trades"]
+def _wallet_idx(v) -> int:
+    try:
+        return max(0, min(PAPER_N - 1, int(v)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wallet_summary(w: dict) -> dict:
+    closed = [t for t in w["trades"] if t["status"] in ("win", "loss")]
+    return {"name": w["name"], "enabled": w["enabled"], "pnl": round(sum(t["pnl"] for t in closed), 2),
+            "open": sum(1 for t in w["trades"] if t["status"] == "open")}
+
+
+async def _paper_payload(idx: int = 0):
+    w = wallets[idx]
+    trades = w["trades"]
     closed = [t for t in trades if t["status"] in ("win", "loss")]
     wins = sum(1 for t in closed if t["status"] == "win")
     losses = len(closed) - wins
     open_trades = [t for t in trades if t["status"] == "open"]
     open_cost = sum(t["cost"] + t["fee"] for t in open_trades)
     pnl = sum(t["pnl"] for t in closed)
-    curve = [round(paper["deposit"], 2)]
-    run = paper["deposit"]
+    curve = [round(w["deposit"], 2)]
+    run = w["deposit"]
     for t in sorted([t for t in trades if t["status"] in ("win", "loss", "void") and t["settled_at"]],
                     key=lambda t: (t["settled_at"], t["id"])):
         run += t["pnl"]
         curve.append(round(run, 2))
     return {
+        "w": idx,
+        "wallets": [_wallet_summary(x) for x in wallets],
         "config": {
-            "enabled": paper["enabled"],
-            "coins": paper["coins"],
-            "stake_mode": paper["stake_mode"],
-            "stake_value": paper["stake_value"],
-            "min_edge": paper["min_edge"],
-            "min_price": paper["min_price"],
-            "max_price": paper["max_price"],
-            "deposit": paper["deposit"],
+            "name": w["name"],
+            "enabled": w["enabled"],
+            "coins": w["coins"],
+            "stake_mode": w["stake_mode"],
+            "stake_value": w["stake_value"],
+            "min_edge": w["min_edge"],
+            "min_price": w["min_price"],
+            "max_price": w["max_price"],
+            "deposit": w["deposit"],
         },
         "account": {
-            "balance": round(paper["balance"], 2),
-            "equity": round(paper["balance"] + open_cost, 2),
+            "balance": round(w["balance"], 2),
+            "equity": round(w["balance"] + open_cost, 2),
             "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl / paper["deposit"] * 100, 2) if paper["deposit"] else 0.0,
+            "pnl_pct": round(pnl / w["deposit"] * 100, 2) if w["deposit"] else 0.0,
             "wins": wins,
             "losses": losses,
             "open": len(open_trades),
@@ -2394,7 +2752,7 @@ async def _paper_payload():
 
 
 async def api_paper(request):
-    return JSONResponse(await _paper_payload())
+    return JSONResponse(await _paper_payload(_wallet_idx(request.query_params.get("w"))))
 
 
 async def api_paper_config(request):
@@ -2402,60 +2760,68 @@ async def api_paper_config(request):
         b = await request.json()
     except Exception:
         b = {}
+    idx = _wallet_idx(b.get("w"))
+    w = wallets[idx]
+    if "name" in b:
+        nm = str(b["name"] or "").strip()[:24]
+        if nm:
+            w["name"] = nm
     if "enabled" in b:
-        paper["enabled"] = bool(b["enabled"])
+        w["enabled"] = bool(b["enabled"])
     coins = b.get("coins")
     if isinstance(coins, dict):
         for c in PAPER_COINS:
             if c in coins:
-                paper["coins"][c] = bool(coins[c])
+                w["coins"][c] = bool(coins[c])
     mode = b.get("stake_mode")
     if mode in ("pct", "usd", "kelly"):
-        paper["stake_mode"] = mode
+        w["stake_mode"] = mode
     try:
         v = float(b.get("stake_value"))
-        if paper["stake_mode"] in ("pct", "kelly"):
+        if w["stake_mode"] in ("pct", "kelly"):
             v = max(0.1, min(100.0, v))
         else:
             v = max(1.0, min(1e7, v))
-        paper["stake_value"] = round(v, 2)
+        w["stake_value"] = round(v, 2)
     except (TypeError, ValueError):
         pass
     for key, lo, hi, cast in (("min_edge", 0.0, 50.0, float), ("min_price", 0, 99, int), ("max_price", 1, 99, int)):
         if key in b:
             try:
-                paper[key] = cast(max(lo, min(hi, float(b[key]))))
+                w[key] = cast(max(lo, min(hi, float(b[key]))))
             except (TypeError, ValueError):
                 pass
-    if paper["min_price"] > paper["max_price"]:
-        paper["min_price"] = 0
+    if w["min_price"] > w["max_price"]:
+        w["min_price"] = 0
     if "deposit" in b:
         try:
             dep = float(b["deposit"])
-            if abs(dep - paper["deposit"]) > 1e-9:
-                _paper_reset(dep)
+            if abs(dep - w["deposit"]) > 1e-9:
+                _paper_reset(w, dep)
         except (TypeError, ValueError):
             pass
     paper_save()
-    return JSONResponse(await _paper_payload())
+    return JSONResponse(await _paper_payload(idx))
 
 
-def _paper_reset(dep: float):
+def _paper_reset(w: dict, dep: float):
     dep = max(1.0, min(1e9, dep))
-    paper["deposit"] = round(dep, 2)
-    paper["balance"] = round(dep, 2)
-    paper["trades"] = []
+    w["deposit"] = round(dep, 2)
+    w["balance"] = round(dep, 2)
+    w["trades"] = []
     paper_save()
 
 
 async def api_paper_reset(request):
+    idx = 0
     try:
         b = await request.json()
+        idx = _wallet_idx(b.get("w"))
         dep = float(b.get("deposit"))
     except Exception:
-        return JSONResponse(await _paper_payload())
-    _paper_reset(dep)
-    return JSONResponse(await _paper_payload())
+        return JSONResponse(await _paper_payload(idx))
+    _paper_reset(wallets[idx], dep)
+    return JSONResponse(await _paper_payload(idx))
 
 
 class PasswordMiddleware(BaseHTTPMiddleware):
